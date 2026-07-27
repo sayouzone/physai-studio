@@ -1,8 +1,18 @@
 // web/libs/editor/src/components/Common/GeoMapView.jsx
 import { useEffect, useRef } from "react";
 
-// ⚠️ 실제 키로 교체 (GCP Console → Maps JavaScript API)
-const GOOGLE_MAPS_API_KEY = "AIzaSyBUyoyBl2APXFI59pQar4WsSUUpjZs0E3c";
+let cachedApiKey = null;
+
+const fetchApiKey = async () => {
+    if (cachedApiKey) return cachedApiKey;
+    const res = await fetch('/api/config/frontend', {
+        headers: { 'X-CSRFToken': document.cookie.match(/csrftoken=([^;]+)/)?.[1] ?? '' },
+    });
+    const data = await res.json();
+    cachedApiKey = data.google_maps_api_key;
+    console.log('Google Maps API Key:', cachedApiKey);
+    return cachedApiKey;
+};
 
 const CLASS_STYLES = {
     pv: { strokeColor: "#4285F4", fillColor: "#4285F4", fillOpacity: 0.25 },
@@ -17,16 +27,18 @@ const loadGoogleMaps = () => {
     if (window.google?.maps) return Promise.resolve();
     if (mapsScriptPromise) return mapsScriptPromise;
 
-    mapsScriptPromise = new Promise((resolve, reject) => {
-        const script = document.createElement("script");
-        script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}`;
-        script.async = true;
-        script.onload = resolve;
-        script.onerror = () => {
-            mapsScriptPromise = null;
-            reject(new Error("Google Maps 스크립트 로드 실패"));
-        };
-        document.head.appendChild(script);
+    mapsScriptPromise = fetchApiKey().then((apiKey) => {
+        return new Promise((resolve, reject) => {
+            const script = document.createElement("script");
+            script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}`;
+            script.async = true;
+            script.onload = resolve;
+            script.onerror = () => {
+                mapsScriptPromise = null;
+                reject(new Error("Google Maps 스크립트 로드 실패"));
+            };
+            document.head.appendChild(script);
+        });
     });
     return mapsScriptPromise;
 };

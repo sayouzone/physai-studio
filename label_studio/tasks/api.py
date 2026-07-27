@@ -13,6 +13,7 @@ from data_manager.api import TaskListAPI as DMTaskListAPI
 from data_manager.functions import evaluate_predictions
 from data_manager.models import PrepareParams
 from data_manager.serializers import DataManagerTaskSerializer
+from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -25,6 +26,7 @@ from projects.models import Project
 from rest_framework import generics, viewsets
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from tasks.models import Annotation, AnnotationDraft, Prediction, Task
 from tasks.openapi_schema import (
@@ -1542,3 +1544,14 @@ class AnnotationGeoreferencingAPI(generics.RetrieveAPIView):
             organization, project, WebhookAction.ANNOTATIONS_DELETED, [pk]
         )
         return Response(status=201, data=AnnotationDraftSerializer(instance=draft).data)
+
+class FrontendConfigAPI(generics.GenericAPIView):
+    permission_classes = [IsAuthenticated]  # 로그인 사용자만
+
+    google_maps_api_key = settings.GOOGLE_MAPS_API_KEY
+    print("GOOGLE_MAPS_API_KEY", google_maps_api_key)
+
+    def get(self, request, *args, **kwargs):
+        return Response({
+            'google_maps_api_key': self.google_maps_api_key,
+        })

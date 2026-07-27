@@ -48,4 +48,5 @@ urlpatterns = [
     path('api/annotations/', include((_api_annotations_urlpatterns, app_name), namespace='api-annotations')),
     path('api/drafts/', include((_api_drafts_urlpatterns, app_name), namespace='api-drafts')),
     path('api/', include((_api_predictions_urlpatterns, app_name), namespace='api-predictions')),
+    path('api/config/frontend', api.FrontendConfigAPI.as_view(), name='frontend-config'),
 ]

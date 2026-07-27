@@ -951,3 +951,22 @@ FSM_INITIALIZATION_TRANSITION_NAME = 'fsm.utils._get_initialization_transition_n
 # Used for async migrations. In LSE this is set to a real queue name, including here so we
 # can use settings.SERVICE_QUEUE_NAME in async migrations in LSO
 SERVICE_QUEUE_NAME = get_env('SERVICE_QUEUE_NAME', 'default')
+
+def get_environ(name, default=None, is_bool=False):
+    import environ
+    from django.conf import settings
+
+    env = environ.Env()
+    env_filepath = os.path.join(BASE_DATA_DIR, '.env')
+    print('BASE_DATA_DIR', BASE_DATA_DIR)
+    environ.Env.read_env(env_filepath)
+    print('env_filepath', env_filepath)
+
+    value = env.str(name)
+    if value is not None:
+        return value
+    
+    return default
+
+GOOGLE_MAPS_API_KEY = get_environ('GOOGLE_MAPS_API_KEY')
+print('GOOGLE_MAPS_API_KEY', GOOGLE_MAPS_API_KEY)

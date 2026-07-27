@@ -121,7 +121,6 @@ def get_env(name, default=None, is_bool=False):
                 return value
     return default
 
-
 def has_env(name: str) -> bool:
     """Return True if any supported environment variable name is set for ``name``."""
     return any((prefix + name) in os.environ for prefix in ('LABEL_STUDIO_', 'HEARTEX_', ''))
