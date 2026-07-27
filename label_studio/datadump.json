@@ -1,0 +1,235 @@
+[
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 1,
+  "fields": {
+    "meta": {},
+    "project": null,
+    "name": "0052_auto_20241030_1757",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:10:56.133Z",
+    "updated_at": "2026-07-14T23:10:56.136Z"
+  }
+},
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 2,
+  "fields": {
+    "meta": {},
+    "project": null,
+    "name": "0054_add_brin_index_updated_at",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:10:56.168Z",
+    "updated_at": "2026-07-14T23:10:56.172Z"
+  }
+},
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 3,
+  "fields": {
+    "meta": {},
+    "project": null,
+    "name": "0055_task_proj_octlen_idx_async",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:10:56.190Z",
+    "updated_at": "2026-07-14T23:10:56.194Z"
+  }
+},
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 4,
+  "fields": {
+    "meta": {},
+    "project": null,
+    "name": "0056_prediction_result_proj_gin_idx_async",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:10:56.214Z",
+    "updated_at": "2026-07-14T23:10:56.218Z"
+  }
+},
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 5,
+  "fields": {
+    "meta": {},
+    "project": null,
+    "name": "0057_annotation_proj_result_octlen_idx_async",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:10:56.234Z",
+    "updated_at": "2026-07-14T23:10:56.238Z"
+  }
+},
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 6,
+  "fields": {
+    "meta": {},
+    "project": null,
+    "name": "tasks.migrations.0059_task_completion_id_updated_at_idx_async",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:10:56.271Z",
+    "updated_at": "2026-07-14T23:10:56.275Z"
+  }
+},
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 7,
+  "fields": {
+    "meta": {},
+    "project": null,
+    "name": "0013_cleanup_inconsistent_filtergroup_20250624_2119",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:10:56.594Z",
+    "updated_at": "2026-07-14T23:10:56.594Z"
+  }
+},
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 8,
+  "fields": {
+    "meta": {},
+    "project": null,
+    "name": "0016_migrate_agreement_selected_annotators_to_unique",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:10:56.625Z",
+    "updated_at": "2026-07-14T23:10:56.625Z"
+  }
+},
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 9,
+  "fields": {
+    "meta": {},
+    "project": null,
+    "name": "0017_update_agreement_selected_to_nested_structure",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:10:56.644Z",
+    "updated_at": "2026-07-14T23:10:56.644Z"
+  }
+},
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 10,
+  "fields": {
+    "meta": {
+      "updated_views": 0
+    },
+    "project": null,
+    "name": "data_manager.migrations.0018_remove_allow_skip",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:10:56.660Z",
+    "updated_at": "2026-07-14T23:10:56.662Z"
+  }
+},
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 11,
+  "fields": {
+    "meta": {},
+    "project": null,
+    "name": "0028_auto_20241107_1031",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:10:56.690Z",
+    "updated_at": "2026-07-14T23:10:56.693Z"
+  }
+},
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 12,
+  "fields": {
+    "meta": {},
+    "project": null,
+    "name": "0030_project_search_vector_index",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:10:56.732Z",
+    "updated_at": "2026-07-14T23:10:56.736Z"
+  }
+},
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 13,
+  "fields": {
+    "meta": {},
+    "project": null,
+    "name": "0017_auto_20240731_1638",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:10:58.998Z",
+    "updated_at": "2026-07-14T23:10:59.020Z"
+  }
+},
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 14,
+  "fields": {
+    "meta": {},
+    "project": null,
+    "name": "0033_projects_soft_delete_indexes_async",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:11:00.302Z",
+    "updated_at": "2026-07-14T23:11:00.312Z"
+  }
+},
+{
+  "model": "core.asyncmigrationstatus",
+  "pk": 15,
+  "fields": {
+    "meta": {},
+    "project": null,
+    "name": "tasks.migrations.0061_task_project_file_upload_idx_async",
+    "status": "FINISHED",
+    "created_at": "2026-07-14T23:11:00.406Z",
+    "updated_at": "2026-07-14T23:11:00.411Z"
+  }
+},
+{
+  "model": "users.user",
+  "fields": {
+    "password": "pbkdf2_sha256$870000$ly5Bvee6efVKiymhrWdx5M$ALL/bMUAvn7MfZ1F75L1HUZNo+uXmzuLys+3mjcpIRw=",
+    "last_login": null,
+    "is_superuser": false,
+    "last_activity": "2026-07-14T23:13:26.468Z",
+    "username": "sjkim",
+    "email": "sjkim@sayouzone.com",
+    "first_name": "",
+    "last_name": "",
+    "phone": "",
+    "avatar": "",
+    "custom_hotkeys": {},
+    "is_staff": false,
+    "is_active": true,
+    "date_joined": "2026-07-14T23:13:26.468Z",
+    "activity_at": "2026-07-14T23:15:43.111Z",
+    "active_organization": 1,
+    "allow_newsletters": null,
+    "groups": [],
+    "user_permissions": []
+  }
+},
+{
+  "model": "organizations.organizationmember",
+  "pk": 1,
+  "fields": {
+    "user": [
+      "sjkim@sayouzone.com"
+    ],
+    "organization": 1,
+    "created_at": "2026-07-14T23:13:26.719Z",
+    "updated_at": "2026-07-14T23:13:26.719Z",
+    "deleted_at": null
+  }
+},
+{
+  "model": "organizations.organization",
+  "pk": 1,
+  "fields": {
+    "title": "Label Studio",
+    "token": "Nn3JPnDkCcFTYSuTVuav94QdcBuahP8b9r4Nz9qK",
+    "created_by": [
+      "sjkim@sayouzone.com"
+    ],
+    "created_at": "2026-07-14T23:13:26.703Z",
+    "updated_at": "2026-07-14T23:13:26.703Z",
+    "contact_info": null
+  }
+}
+]
