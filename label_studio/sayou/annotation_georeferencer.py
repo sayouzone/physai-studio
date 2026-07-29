@@ -34,14 +34,10 @@ from enum import Enum
 from typing import List, Optional, Sequence, Tuple, Dict, Any
 
 from sayou.georeferencing.dji.camera_pose import compute_camera_axes_from_gimbal, verify_nadir_orientation
-from sayou.georeferencing.dji.metadata import DJIMetadata, M_PER_DEG_LAT
 from sayou.georeferencing.dji.georeferencer import (
-    DJIImageGeoreferencer,
-    GroundPlaneSource,
     resolve_ground_plane,
-    calibrate_panel_height,
 )
-from sayou.georeferencing.dji.coordinates import geodetic_to_enu
+from sayou.georeferencing.coordinates import geodetic_to_enu
 from sayou.georeferencing.yolo_to_geo import (
     YOLODetection,
     _compute_polygon_area_m2,

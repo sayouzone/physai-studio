@@ -48,6 +48,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from sayou.image.metadata import ImageMetadata, extract_metadata, estimate_intrinsics_from_metadata
 
+"""
 from .metadata import (
     #DJIMetadata,
     CameraIntrinsics,
@@ -56,7 +57,8 @@ from .metadata import (
     #estimate_intrinsics_from_metadata,
     dji_gimbal_to_camera_rotation, estimate_zh20t_thermal_intrinsics
 )
-from .coordinates import (
+"""
+from sayou.georeferencing.coordinates import (
     ENUPoint,
     GeodeticPoint,
     enu_to_geodetic,

@@ -19,8 +19,8 @@ import json
 
 import numpy as np
 
-from .dji.coordinates import GeodeticPoint, geodetic_to_enu
-from .dji.georeferencer import DJIImageGeoreferencer
+from sayou.georeferencing.coordinates import GeodeticPoint, geodetic_to_enu
+from sayou.georeferencing.dji.georeferencer import DJIImageGeoreferencer
 
 
 @dataclass
