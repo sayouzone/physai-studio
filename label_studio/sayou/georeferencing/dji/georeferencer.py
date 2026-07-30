@@ -64,7 +64,7 @@ from sayou.georeferencing.coordinates import (
     enu_to_geodetic,
     geodetic_to_enu,
 )
-from .camera_pose import compute_camera_axes_from_gimbal, verify_nadir_orientation
+from sayou.georeferencing.dji.camera_pose import compute_camera_axes_from_gimbal, verify_nadir_orientation
 
 logger = logging.getLogger(__name__)
 

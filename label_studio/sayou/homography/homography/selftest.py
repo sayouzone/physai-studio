@@ -1,6 +1,6 @@
 """부호 규약 및 호모그래피 수식 자기검증.
 
-    python -m sayou.georeferencing.homography.selftest
+    python -m solar_thermal.georeferencing.homography.selftest
 
 이 파일이 통과하는 한, ``pose`` 와 ``homography`` 는 ``geometry`` 의 공선조건
 규약과 정확히 같은 세계에 있다. 규약을 건드리는 변경을 할 때 **먼저** 여기를
