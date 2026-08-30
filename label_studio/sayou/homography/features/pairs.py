@@ -26,7 +26,7 @@ import time
 from typing import Iterable, Sequence
 from scipy.spatial import cKDTree
 
-from sayou.image.metadata import ImageMetadata
+from ...image.metadata import ImageMetadata
 
 from ..crs import CRSConverter
 from ..gpu_backend import free_gpu_memory

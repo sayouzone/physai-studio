@@ -241,8 +241,7 @@ def run_homography_pipeline(image_dir: Path,
                  attitude_sigma_deg: float = 1.0,
                  plane_tilt_tolerance_deg: float = 1.0,
                  ba_max_nfev: int = 200,
-                 coarse_ba_ftol: float = 1e-4,
-                 use_feature_cache: bool = True,
+                 coarse_ba_ftol: float = 1e-3,
                  tri_z_band_m: float = 25.0,
                  fine_tri_angle_deg: float = 5.0,
                  use_dsm: bool = True,
@@ -335,21 +334,7 @@ def run_homography_pipeline(image_dir: Path,
             logger.warning("겹침 기반 인접쌍이 0개 — k-NN 폴백")
             pairs = find_neighbor_pairs(metas, crs, k_neighbors=k_neighbors)
 
-        # ★ SIFT 추출 + 매칭은 전체 시간의 48% 인데(실측 20m49s 중 9m41s),
-        #   입력 이미지가 같으면 결과가 항상 같다. 파라미터를 바꿔 가며
-        #   반복 실행할 때 매번 다시 계산할 이유가 없다.
-        #   초점거리·BA·모자이크 설정을 바꿔도 이 단계 결과는 안 바뀌므로
-        #   캐시가 그대로 유효하다 — 재실행이 절반으로 줄어든다.
-        from .features.cache import FeatureCache
-        _cache = FeatureCache(output_dir, enabled=use_feature_cache)
-        _ckey = {"pairs": len(pairs), "k_neighbors": k_neighbors}
-        _hit = _cache.load(metas, pairs, _ckey)
-        if _hit is not None:
-            matches, _feats_ser = _hit
-            features = FeatureCache.restore_features(_feats_ser)
-        else:
-            matches, features = build_tie_points(metas, pairs)
-            _cache.save(metas, pairs, _ckey, matches, features)
+        matches, features = build_tie_points(metas, pairs)
         logger.info("[stage] SfM 매칭: %s", fmt_elapsed(time.perf_counter() - t0))
 
         # ---- 5a. track --------------------------------------------------

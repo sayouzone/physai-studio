@@ -38,7 +38,7 @@ import logging
 
 import numpy as np
 
-from sayou.image.metadata import ImageMetadata
+from ..image.metadata import ImageMetadata
 
 logger = logging.getLogger(__name__)
 

@@ -64,8 +64,6 @@ def fit_plane_ransac(points_xyz: np.ndarray,
                      inlier_threshold_m: float = 0.5,
                      n_iterations: int = 500,
                      min_inlier_ratio: float = 0.3,
-                     surface: str = "upper",
-                     surface_gap_m: float = 0.6,
                      seed: int = 0) -> GroundPlane | None:
     """3D 점군 → ``Z = a·x + b·y + c`` 평면 (RANSAC + 최소제곱 재적합).
 
@@ -160,72 +158,12 @@ def fit_plane_ransac(points_xyz: np.ndarray,
     # 있으므로 c 는 '중심점에서의 표고' 라는 읽을 수 있는 값으로 남는다.
     c = c_ctr + ctr[2]
 
-    # ---- 상면(패널 상면) 으로 이동 -------------------------------------
-    # ★ 태양광 단지의 점군은 '지면' 과 '패널 상면' 두 층으로 갈린다. RANSAC
-    #   은 그중 점이 많은 쪽 하나만 잡는데, 지면(잔디/자갈) 텍스처가 특징점을
-    #   더 많이 내면 **지면 평면**이 선택된다. 그러면 패널이 프레임마다
-    #   Δh·tanθ 만큼 밀려(relief displacement) 모자이크 시임에서 뚝 끊긴다
-    #   (H20T 45.9 m 고도, 패널 1.8 m 기준 최대 174 cm = 패널 한 장 폭).
-    #
-    #   검사 대상이 패널이므로 기준면은 **패널 상면**이어야 한다. 전체 점군의
-    #   잔차 분포에서 적합 평면보다 위쪽에 유의한 층이 또 있으면 그 층으로
-    #   c 를 올린다. 경사(a, b) 는 두 층이 평행하다고 보고 그대로 쓴다.
-    if surface == "upper":
-        all_resid = P[:, 2] - (a * P[:, 0] + b * P[:, 1] + c_ctr)
-        c_shift = _find_upper_layer(all_resid, inlier_threshold_m,
-                                    surface_gap_m)
-        if c_shift > 0:
-            c += c_shift
-            upper_n = int(np.sum(np.abs(all_resid - c_shift)
-                                 <= inlier_threshold_m))
-            logger.info("상면 층 검출: 적합 평면보다 %.2f m 위에 점 %d개 — "
-                        "기준면을 그쪽으로 올림 (태양광 패널 상면으로 추정)",
-                        c_shift, upper_n)
-            best_count = upper_n
-            rmse = float(np.sqrt(np.mean(
-                (all_resid[np.abs(all_resid - c_shift) <= inlier_threshold_m]
-                 - c_shift) ** 2))) if upper_n else rmse
-
     logger.info("지상평면 적합: 경사 %.3f°, 중심표고 %.2f m, RMSE %.3f m, "
                 "inlier %d/%d (%.1f%%)",
                 tilt, c, rmse, best_count, n, ratio * 100)
     return GroundPlane(a=a, b=b, c=c,
                        origin_xy=(float(ctr[0]), float(ctr[1])),
                        inlier_rmse_m=rmse, n_inliers=best_count)
-
-
-def _find_upper_layer(residuals: np.ndarray,
-                      bin_m: float,
-                      min_gap_m: float,
-                      min_fraction: float = 0.10) -> float:
-    """적합 평면 위쪽에 있는 두 번째 층까지의 거리 (m). 없으면 0.
-
-    잔차 히스토그램에서 최빈 봉우리(=적합된 층)보다 ``min_gap_m`` 이상 위에
-    있으면서 전체의 ``min_fraction`` 이상을 차지하는 봉우리를 찾는다.
-    태양광 단지에서 이 봉우리가 패널 상면이다.
-
-    ``min_fraction`` 이 문턱 역할을 한다 — 잡음이나 소수의 이상점(전신주,
-    새) 때문에 기준면이 엉뚱하게 올라가지 않도록.
-    """
-    r = residuals[np.isfinite(residuals)]
-    if r.size < 20:
-        return 0.0
-    lo, hi = float(np.percentile(r, 1)), float(np.percentile(r, 99))
-    if hi - lo < min_gap_m:
-        return 0.0                      # 단일 층 — 이동할 이유 없음.
-    bins = max(int(np.ceil((hi - lo) / max(bin_m, 1e-3))), 4)
-    hist, edges = np.histogram(r, bins=bins, range=(lo, hi))
-    centers = 0.5 * (edges[:-1] + edges[1:])
-
-    base_i = int(np.argmax(hist))
-    base_c = centers[base_i]
-    upper = (centers > base_c + min_gap_m)
-    if not upper.any():
-        return 0.0
-    cand_i = np.nonzero(upper)[0][int(np.argmax(hist[upper]))]
-    if hist[cand_i] < min_fraction * r.size:
-        return 0.0                      # 위쪽 층이 너무 얇다 — 이상점일 것.
-    return float(centers[cand_i] - base_c)
 
 
 # ---------------------------------------------------------------------------
@@ -299,17 +237,11 @@ def estimate_ground_plane(*,
                           camera_xyz: np.ndarray | None = None,
                           panel_top_offset_m: float = 0.0,
                           allow_tilt: bool = True,
-                          inlier_threshold_m: float = 0.5,
-                          surface: str = "upper") -> GroundPlane:
-    """우선순위에 따라 지상평면을 결정. 모든 경로가 실패하면 ``ValueError``.
-
-    ``surface="upper"`` (기본) 는 점군에 두 층이 있으면 위층(태양광 패널
-    상면) 을 기준면으로 삼는다. 지면 기준이 필요하면 ``"dominant"``.
-    """
+                          inlier_threshold_m: float = 0.5) -> GroundPlane:
+    """우선순위에 따라 지상평면을 결정. 모든 경로가 실패하면 ``ValueError``."""
     if points_xyz is not None and len(points_xyz) >= 3:
         plane = fit_plane_ransac(points_xyz, allow_tilt=allow_tilt,
-                                 inlier_threshold_m=inlier_threshold_m,
-                                 surface=surface)
+                                 inlier_threshold_m=inlier_threshold_m)
         if plane is not None:
             return plane
         logger.warning("BA 점군 평면 적합 실패 — LRF/메타데이터로 폴백")
@@ -317,16 +249,6 @@ def estimate_ground_plane(*,
     if metas is not None and camera_xyz is not None:
         plane = plane_from_lrf(metas, camera_xyz)
         if plane is not None:
-            # LRF 는 조준점(=지면) 실측이므로 패널 상면 기준이 필요하면
-            # 오프셋을 더해야 한다. BA 점군 경로와 기준면을 맞춘다.
-            if panel_top_offset_m:
-                plane = GroundPlane(plane.a, plane.b,
-                                    plane.c + panel_top_offset_m,
-                                    origin_xy=plane.origin_xy,
-                                    inlier_rmse_m=plane.inlier_rmse_m,
-                                    n_inliers=plane.n_inliers)
-                logger.info("LRF 평면에 패널 상면 오프셋 +%.2f m 적용",
-                            panel_top_offset_m)
             return plane
 
     if metas is not None:

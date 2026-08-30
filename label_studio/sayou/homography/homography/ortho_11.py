@@ -122,10 +122,6 @@ class MosaicConfig:
         비운다 — 품질을 우선할 때.
     tile_memory_mb : 타일 하나의 메모리 예산 (MB). 출력이 아무리 커도
         메모리는 이 값으로 묶인다.
-    prefetch_workers : 원본 이미지를 미리 읽는 스레드 수 (0 이면 끔).
-        JPEG 디코딩이 모자이크 비용의 대부분이고 GIL 을 놓으므로, 합성과
-        겹쳐 실행하면 시간이 줄어든다.
-    prefetch_ahead : 몇 장 앞까지 미리 읽을지.
     image_cache : 원본 이미지 LRU 캐시 장수. 한 프레임이 여러 타일에 걸치면
         재사용된다. 늘리면 디코딩이 줄고 메모리는 는다.
     band_count, dtype, max_out_pixels : 출력 형식.
@@ -152,8 +148,6 @@ class MosaicConfig:
                  offnadir_fallback: bool = True,
                  tile_memory_mb: float = 256.0,
                  image_cache: int = 8,
-                 prefetch_workers: int = 4,
-                 prefetch_ahead: int = 4,
                  band_count: int = 3,
                  dtype=np.uint8,
                  max_out_pixels: int = MAX_OUT_PIXELS):
@@ -179,8 +173,6 @@ class MosaicConfig:
         self.offnadir_fallback = bool(offnadir_fallback)
         self.tile_memory_mb = float(max(tile_memory_mb, 32.0))
         self.image_cache = int(max(image_cache, 1))
-        self.prefetch_workers = int(max(prefetch_workers, 0))
-        self.prefetch_ahead = int(max(prefetch_ahead, 0))
         self.band_count = int(band_count)
         self.dtype = dtype
         self.max_out_pixels = int(max_out_pixels)
@@ -727,41 +719,16 @@ def mosaic_frames(frames: list[FrameHomography],
     maps_cache: dict[tuple, object] = {}
     img_cache: dict[int, np.ndarray] = {}
 
-    def _decode(idx):
-        im = cv2.imread(str(image_paths[idx]), cv2.IMREAD_UNCHANGED)
-        if im is not None:
-            if im.ndim == 3 and im.shape[2] >= 3:
-                im = cv2.cvtColor(im[:, :, :3], cv2.COLOR_BGR2RGB)
-            elif im.ndim == 2 and bands == 3:
-                im = cv2.cvtColor(im, cv2.COLOR_GRAY2RGB)
-        return im
-
-    # ★ 모자이크가 남은 최대 비용이다 (실측 21m15s 중 7m36s).
-    #   비용의 대부분은 **JPEG 디코딩**이다 — 프레임이 걸치는 타일마다 다시
-    #   디코딩하므로 380장 × 약 2타일 = 760회, 20 MP 이미지다.
-    #   OpenCV 의 imread 는 GIL 을 놓으므로 스레드로 **미리 읽어두면**
-    #   합성(warp/compositing)과 겹쳐 실행된다.
-    #   전역 라벨맵이 승자를 이미 정해 두었으므로 프레임 처리 순서가
-    #   결과에 영향을 주지 않는다 — 선읽기가 안전하다.
-    _pool = None
-    _futures: dict = {}
-    if cfg.prefetch_workers > 0:
-        from concurrent.futures import ThreadPoolExecutor
-        _pool = ThreadPoolExecutor(max_workers=cfg.prefetch_workers)
-
-    def prefetch(indices):
-        if _pool is None:
-            return
-        for i in indices:
-            if i not in img_cache and i not in _futures:
-                _futures[i] = _pool.submit(_decode, i)
-
     def load(idx):
         if idx not in img_cache:
-            fut = _futures.pop(idx, None)
-            im = fut.result() if fut is not None else _decode(idx)
+            im = cv2.imread(str(image_paths[idx]), cv2.IMREAD_UNCHANGED)
+            if im is not None:
+                if im.ndim == 3 and im.shape[2] >= 3:
+                    im = cv2.cvtColor(im[:, :, :3], cv2.COLOR_BGR2RGB)
+                elif im.ndim == 2 and bands == 3:
+                    im = cv2.cvtColor(im, cv2.COLOR_GRAY2RGB)
             img_cache[idx] = im
-            while len(img_cache) > cfg.image_cache:
+            if len(img_cache) > cfg.image_cache:
                 img_cache.pop(next(iter(img_cache)))
         return img_cache[idx]
 
@@ -796,17 +763,13 @@ def mosaic_frames(frames: list[FrameHomography],
                     flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
                     borderMode=cv2.BORDER_REPLICATE)
 
-            tile_idx = [i for i in order
-                        if wins.get(i) is not None
-                        and not (wins[i][1] + wins[i][3] <= v0t
-                                 or wins[i][1] >= v0t + th)]
-            prefetch(tile_idx[:cfg.image_cache])
-
-            for pos, idx in enumerate(tile_idx):
-                # 앞으로 쓸 프레임을 미리 읽어 둔다 (디코딩과 합성을 겹침).
-                prefetch(tile_idx[pos + 1: pos + 1 + cfg.prefetch_ahead])
-                w_ = wins[idx]
+            for idx in order:
+                w_ = wins.get(idx)
+                if w_ is None:
+                    continue
                 fu0, fv0, fw, fh_ = w_
+                if fv0 + fh_ <= v0t or fv0 >= v0t + th:
+                    continue                      # 이 타일과 안 겹침
                 img = load(idx)
                 if img is None:
                     continue
@@ -858,11 +821,6 @@ def mosaic_frames(frames: list[FrameHomography],
             del canvas, score
             if (t + 1) % 5 == 0 or t == n_tiles - 1:
                 logger.info("  타일 %d/%d 완료", t + 1, n_tiles)
-
-    if _pool is not None:
-        for f_ in _futures.values():
-            f_.cancel()
-        _pool.shutdown(wait=False)
 
     fill_ratio = filled_total / float(out_w * out_h)
     logger.info("모자이크 저장: %s (%d장 합성, 충전율 %.1f%%)",

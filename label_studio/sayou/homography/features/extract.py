@@ -242,11 +242,11 @@ def extract_features_orb(
 def extract_features(image_path: Path, max_features: int = 8000):
     img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
     
-    sift = cv2.SIFT_create(nfeatures=max_features)
-    kp, desc = sift.detectAndCompute(img, None)
+    detector = cv2.SIFT_create(nfeatures=max_features)
+    kp, desc = detector.detectAndCompute(img, None)
 
-    #orb = cv2.ORB_create(nfeatures=max_features)
-    #kp, desc = orb.detectAndCompute(img, None)
+    #detector = cv2.ORB_create(nfeatures=max_features)
+    #kp, desc = detector.detectAndCompute(img, None)
     #print(kp, type(kp), desc, type(desc))
     
     return kp, desc, img.shape

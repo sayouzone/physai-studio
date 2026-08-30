@@ -233,7 +233,7 @@ def run_homography_pipeline(image_dir: Path,
                  focal_max_total: float = 0.25,
                  mid_reproj_factor: float = 3.0,
                  estimate_distortion: bool = False,
-                 auto_distortion: bool = True,
+                 auto_distortion: bool = False,
                  fine_gate_auto: bool = True,
                  fine_gate_max_px: float = 8.0,
                  distortion_max_rounds: int = 1,
@@ -241,8 +241,6 @@ def run_homography_pipeline(image_dir: Path,
                  attitude_sigma_deg: float = 1.0,
                  plane_tilt_tolerance_deg: float = 1.0,
                  ba_max_nfev: int = 200,
-                 coarse_ba_ftol: float = 1e-4,
-                 use_feature_cache: bool = True,
                  tri_z_band_m: float = 25.0,
                  fine_tri_angle_deg: float = 5.0,
                  use_dsm: bool = True,
@@ -335,21 +333,7 @@ def run_homography_pipeline(image_dir: Path,
             logger.warning("겹침 기반 인접쌍이 0개 — k-NN 폴백")
             pairs = find_neighbor_pairs(metas, crs, k_neighbors=k_neighbors)
 
-        # ★ SIFT 추출 + 매칭은 전체 시간의 48% 인데(실측 20m49s 중 9m41s),
-        #   입력 이미지가 같으면 결과가 항상 같다. 파라미터를 바꿔 가며
-        #   반복 실행할 때 매번 다시 계산할 이유가 없다.
-        #   초점거리·BA·모자이크 설정을 바꿔도 이 단계 결과는 안 바뀌므로
-        #   캐시가 그대로 유효하다 — 재실행이 절반으로 줄어든다.
-        from .features.cache import FeatureCache
-        _cache = FeatureCache(output_dir, enabled=use_feature_cache)
-        _ckey = {"pairs": len(pairs), "k_neighbors": k_neighbors}
-        _hit = _cache.load(metas, pairs, _ckey)
-        if _hit is not None:
-            matches, _feats_ser = _hit
-            features = FeatureCache.restore_features(_feats_ser)
-        else:
-            matches, features = build_tie_points(metas, pairs)
-            _cache.save(metas, pairs, _ckey, matches, features)
+        matches, features = build_tie_points(metas, pairs)
         logger.info("[stage] SfM 매칭: %s", fmt_elapsed(time.perf_counter() - t0))
 
         # ---- 5a. track --------------------------------------------------
@@ -518,9 +502,6 @@ def run_homography_pipeline(image_dir: Path,
                         f_px=f_rep, cx=cx_rep, cy=cy_rep,
                         attitude_sigma_deg=attitude_sigma_deg,
                         max_nfev=ba_max_nfev,
-                        # 느슨/중간 단계만 조기 종료. 정밀 단계는 엄격하게.
-                        coarse_ftol=(0.0 if label.startswith("2차")
-                                     else coarse_ba_ftol),
                     )
                 else:
                     cams_cur, pts_opt, ba_rmse = rtk_constrained_bundle_adjustment(
@@ -865,31 +846,14 @@ def run_homography_pipeline(image_dir: Path,
         try:
             d_check = gsd_m * float(np.median([k.f_px for k in intrinsics_obj]))
             d_meta = focal_info.get("d_metadata_median_m")
-            # ★ 기준면이 '패널 상면' 으로 올라가면 GSD×f_px 는 카메라→패널
-            #   상면 거리인데, 메타데이터(LRF·RelativeAltitude)는 카메라→
-            #   **지면** 거리다. 그대로 비교하면 패널 높이만큼(약 1 m)
-            #   오차로 잡힌다 — 실측에서 -0.27% 가 -2.4% 로 '악화' 로
-            #   보였는데, 그 1.10 m 차이는 상면 검출이 성공해 기준면이
-            #   0.96 m 올라간 것이 전부였다. 오차가 아니라 기준 차이다.
-            surf_off = 0.0
-            if ref_ground_z is not None:
-                cxp = float(np.mean([f_.camera_xyz[0] for f_ in frames]))
-                cyp = float(np.mean([f_.camera_xyz[1] for f_ in frames]))
-                surf_off = max(float(plane.height_at(cxp, cyp)) - ref_ground_z,
-                               0.0)
             if d_meta:
-                d_meta_eff = d_meta - surf_off
-                resid = d_check / d_meta_eff - 1.0
+                resid = d_check / d_meta - 1.0
                 focal_info["final_check"] = {
                     "gsd_x_f_px_m": d_check, "d_metadata_m": d_meta,
-                    "plane_above_ground_m": surf_off,
-                    "d_metadata_to_plane_m": d_meta_eff,
                     "residual": resid}
                 lvl = logger.warning if abs(resid) > 0.03 else logger.info
                 lvl("초점거리 최종 검증: GSD×f_px = %.2f m vs 메타데이터 "
-                    "%.2f m (기준면이 지면보다 %.2f m 위 → 보정 후 %.2f m) "
-                    "→ 잔차 %+.1f%%%s", d_check, d_meta, surf_off, d_meta_eff,
-                    resid * 100,
+                    "%.2f m → 잔차 %+.1f%%%s", d_check, d_meta, resid * 100,
                     "  (3%% 초과 — --focal-rounds 를 늘려보세요)"
                     if abs(resid) > 0.03 else "")
         except Exception:

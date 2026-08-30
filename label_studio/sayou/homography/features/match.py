@@ -43,8 +43,11 @@ def _match_gpu_hamming(desc1: np.ndarray, desc2: np.ndarray,
 
 
 def _match_cpu(desc1, desc2, norm_type, ratio: float) -> list:
-    bf = cv2.BFMatcher(norm_type)
-    knn = bf.knnMatch(desc1, desc2, k=2)
+    """Brute-Force Matcher for feature matching
+    모든 디스크립터를 전수 조사하므로 이미지 사이즈가 클 경우 속도가 매우 느림.
+    """
+    matcher = cv2.BFMatcher(norm_type)
+    knn = matcher.knnMatch(desc1, desc2, k=2)
     return [m for m, n in knn if m.distance < ratio * n.distance]
 
 

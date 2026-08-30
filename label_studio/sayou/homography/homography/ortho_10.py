@@ -114,18 +114,14 @@ class MosaicConfig:
         갖는데, 초점거리가 보정되면 그 최대값이 변한다 (실측: f 보정으로
         k_max 가 0.479 → 0.552 로 커지자 같은 0.35 제한의 예외율이
         7.7% → 13.4% 로 뛰었다). 각 픽셀을 덮는 프레임들의 최소 k 를 모아
-        **프레임 최대 k 의 일정 비율**로 잡으면 자동으로 따라간다.
-    offnadir_frac : 자동 모드에서 쓸 비율 (프레임 최대 k 대비). 0.65 면
-        H20T 기준 k ≈ 0.37 로, 원래 의도했던 0.35 와 비슷하다.
+        ``offnadir_target_fallback`` 분위수로 제한값을 정하면, 초점거리나
+        중복도가 달라져도 예외율이 일정하게 유지된다.
+    offnadir_target_fallback : 목표 예외율 (0.05 = 5%).
     offnadir_fallback : ``True`` 면 제한 때문에 아무 프레임도 덮지 못하는
         픽셀에 한해 제한을 풀어 채운다 (구멍 방지). ``False`` 면 그 부분을
         비운다 — 품질을 우선할 때.
     tile_memory_mb : 타일 하나의 메모리 예산 (MB). 출력이 아무리 커도
         메모리는 이 값으로 묶인다.
-    prefetch_workers : 원본 이미지를 미리 읽는 스레드 수 (0 이면 끔).
-        JPEG 디코딩이 모자이크 비용의 대부분이고 GIL 을 놓으므로, 합성과
-        겹쳐 실행하면 시간이 줄어든다.
-    prefetch_ahead : 몇 장 앞까지 미리 읽을지.
     image_cache : 원본 이미지 LRU 캐시 장수. 한 프레임이 여러 타일에 걸치면
         재사용된다. 늘리면 디코딩이 줄고 메모리는 는다.
     band_count, dtype, max_out_pixels : 출력 형식.
@@ -148,12 +144,10 @@ class MosaicConfig:
                  dsm=None,
                  max_offnadir_ratio: float = 0.35,
                  offnadir_auto: bool = True,
-                 offnadir_frac: float = 0.65,
+                 offnadir_target_fallback: float = 0.05,
                  offnadir_fallback: bool = True,
                  tile_memory_mb: float = 256.0,
                  image_cache: int = 8,
-                 prefetch_workers: int = 4,
-                 prefetch_ahead: int = 4,
                  band_count: int = 3,
                  dtype=np.uint8,
                  max_out_pixels: int = MAX_OUT_PIXELS):
@@ -175,12 +169,11 @@ class MosaicConfig:
         self.dsm = dsm
         self.max_offnadir_ratio = float(max(max_offnadir_ratio, 0.0))
         self.offnadir_auto = bool(offnadir_auto)
-        self.offnadir_frac = float(np.clip(offnadir_frac, 0.2, 1.0))
+        self.offnadir_target_fallback = float(
+            np.clip(offnadir_target_fallback, 0.0, 0.5))
         self.offnadir_fallback = bool(offnadir_fallback)
         self.tile_memory_mb = float(max(tile_memory_mb, 32.0))
         self.image_cache = int(max(image_cache, 1))
-        self.prefetch_workers = int(max(prefetch_workers, 0))
-        self.prefetch_ahead = int(max(prefetch_ahead, 0))
         self.band_count = int(band_count)
         self.dtype = dtype
         self.max_out_pixels = int(max_out_pixels)
@@ -490,30 +483,57 @@ def _robust_bounds(frames: list[FrameHomography]) -> tuple:
 
 
 def _auto_offnadir_ratio(frames, bounds, cfg, coarse_px: int = 1200) -> float:
-    """프레임 최대 off-nadir 의 일정 비율로 제한값을 잡는다.
+    """픽셀별 '가장 연직에 가까운 프레임의 k' 분포에서 제한값을 정한다.
 
-    ★ 앞선 구현은 "예외율이 목표치가 되도록" 분위수로 정했는데, 실데이터에서
-      **제한을 완전히 무력화**했다. 모자이크 가장자리 밴드가 전체의 5% 를
-      넘으므로 95 분위수가 곧 프레임 최대값이 되어 ``k ≤ 0.5641`` =
-      제한 없음, 예외율 0.0% 가 나왔다. 연직 제한의 이점이 통째로 사라졌다.
-
-      예외율을 목표로 삼은 것이 잘못이었다. 예외 픽셀은 "더 나은 선택지가
-      아예 없는 자리" 이므로 많아도 손해가 아니다. 정작 중요한 것은
-      **선택지가 있는 자리에서 연직에 가까운 쪽을 쓰는 것**이다.
-
-      그래서 규칙을 단순화한다: 제한값 = 프레임 최대 k × ``offnadir_frac``.
-      초점거리가 보정돼 k_max 가 변해도 (실측 0.479 → 0.564) 같은 비율이
-      유지되므로 자동으로 따라간다.
+    각 출력 픽셀은 자기를 덮는 프레임 중 **최소 k** 로 커버될 수 있다.
+    그 최소 k 의 ``1 − target`` 분위수를 제한값으로 삼으면, 정확히
+    ``target`` 비율의 픽셀만 예외 처리된다. 초점거리 보정이나 중복도 변화에
+    자동으로 따라간다.
     """
+    x_min, y_min, x_max, y_max = bounds
+    g = max((x_max - x_min) / coarse_px, (y_max - y_min) / coarse_px)
+    ow, oh = int((x_max - x_min) / g), int((y_max - y_min) / g)
+    if ow < 32 or oh < 32:
+        return cfg.max_offnadir_ratio
+
+    best = np.full((oh, ow), np.inf, dtype=np.float32)
+    for fh in frames:
+        h = float(fh.camera_xyz[2]) - float(
+            fh.plane.height_at(fh.camera_xyz[0], fh.camera_xyz[1]))
+        if h <= 1e-6:
+            continue
+        b = fh.footprint_bounds()
+        if b is None:
+            continue
+        u0 = max(int((b[0] - x_min) / g), 0); u1 = min(int(np.ceil((b[2] - x_min) / g)), ow)
+        v0 = max(int((y_max - b[3]) / g), 0); v1 = min(int(np.ceil((y_max - b[1]) / g)), oh)
+        if u1 <= u0 or v1 <= v0:
+            continue
+        xs = x_min + (np.arange(u0, u1) + 0.5) * g
+        ys = y_max - (np.arange(v0, v1) + 0.5) * g
+        X, Y = np.meshgrid(xs, ys)
+        k = np.hypot(X - fh.camera_xyz[0], Y - fh.camera_xyz[1]) / h
+        sub = best[v0:v1, u0:u1]
+        np.minimum(sub, k.astype(np.float32), out=sub)
+
+    finite = best[np.isfinite(best)]
+    if finite.size < 1000:
+        return cfg.max_offnadir_ratio
+    # 상한은 '프레임 자체의 최대 off-nadir' — 그보다 크게 잡는 것은
+    # 제한이 없는 것과 같다. 하한만 최소한으로 둔다.
     k_max = 0.0
     for fh in frames:
         k_max = max(k_max, float(np.hypot(fh.intr.width, fh.intr.height)
                                  / 2.0 / max(fh.intr.f_px, 1e-6)))
-    if k_max <= 0:
-        return cfg.max_offnadir_ratio
-    ratio = float(np.clip(k_max * cfg.offnadir_frac, 0.15, k_max))
-    logger.info("연직 제한 자동 결정: k ≤ %.3f (프레임 최대 %.3f 의 %.0f%%)",
-                ratio, k_max, cfg.offnadir_frac * 100)
+    ratio = float(np.quantile(finite, 1.0 - cfg.offnadir_target_fallback))
+    ratio = float(np.clip(ratio, 0.15, k_max if k_max > 0 else 0.60))
+    logger.info("연직 제한 자동 결정: k ≤ %.3f (프레임 최대 %.3f, "
+                "목표 예외율 %.0f%%, 설정값 %.3f 대신)",
+                ratio, k_max, cfg.offnadir_target_fallback * 100,
+                cfg.max_offnadir_ratio)
+    if ratio >= k_max - 1e-6:
+        logger.warning("  중복이 낮아 제한을 걸 여지가 없습니다 — 프레임 "
+                       "최외곽까지 쓰게 되며 그 부분은 기복변위가 큽니다.")
     return ratio
 
 
@@ -727,41 +747,16 @@ def mosaic_frames(frames: list[FrameHomography],
     maps_cache: dict[tuple, object] = {}
     img_cache: dict[int, np.ndarray] = {}
 
-    def _decode(idx):
-        im = cv2.imread(str(image_paths[idx]), cv2.IMREAD_UNCHANGED)
-        if im is not None:
-            if im.ndim == 3 and im.shape[2] >= 3:
-                im = cv2.cvtColor(im[:, :, :3], cv2.COLOR_BGR2RGB)
-            elif im.ndim == 2 and bands == 3:
-                im = cv2.cvtColor(im, cv2.COLOR_GRAY2RGB)
-        return im
-
-    # ★ 모자이크가 남은 최대 비용이다 (실측 21m15s 중 7m36s).
-    #   비용의 대부분은 **JPEG 디코딩**이다 — 프레임이 걸치는 타일마다 다시
-    #   디코딩하므로 380장 × 약 2타일 = 760회, 20 MP 이미지다.
-    #   OpenCV 의 imread 는 GIL 을 놓으므로 스레드로 **미리 읽어두면**
-    #   합성(warp/compositing)과 겹쳐 실행된다.
-    #   전역 라벨맵이 승자를 이미 정해 두었으므로 프레임 처리 순서가
-    #   결과에 영향을 주지 않는다 — 선읽기가 안전하다.
-    _pool = None
-    _futures: dict = {}
-    if cfg.prefetch_workers > 0:
-        from concurrent.futures import ThreadPoolExecutor
-        _pool = ThreadPoolExecutor(max_workers=cfg.prefetch_workers)
-
-    def prefetch(indices):
-        if _pool is None:
-            return
-        for i in indices:
-            if i not in img_cache and i not in _futures:
-                _futures[i] = _pool.submit(_decode, i)
-
     def load(idx):
         if idx not in img_cache:
-            fut = _futures.pop(idx, None)
-            im = fut.result() if fut is not None else _decode(idx)
+            im = cv2.imread(str(image_paths[idx]), cv2.IMREAD_UNCHANGED)
+            if im is not None:
+                if im.ndim == 3 and im.shape[2] >= 3:
+                    im = cv2.cvtColor(im[:, :, :3], cv2.COLOR_BGR2RGB)
+                elif im.ndim == 2 and bands == 3:
+                    im = cv2.cvtColor(im, cv2.COLOR_GRAY2RGB)
             img_cache[idx] = im
-            while len(img_cache) > cfg.image_cache:
+            if len(img_cache) > cfg.image_cache:
                 img_cache.pop(next(iter(img_cache)))
         return img_cache[idx]
 
@@ -796,17 +791,13 @@ def mosaic_frames(frames: list[FrameHomography],
                     flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
                     borderMode=cv2.BORDER_REPLICATE)
 
-            tile_idx = [i for i in order
-                        if wins.get(i) is not None
-                        and not (wins[i][1] + wins[i][3] <= v0t
-                                 or wins[i][1] >= v0t + th)]
-            prefetch(tile_idx[:cfg.image_cache])
-
-            for pos, idx in enumerate(tile_idx):
-                # 앞으로 쓸 프레임을 미리 읽어 둔다 (디코딩과 합성을 겹침).
-                prefetch(tile_idx[pos + 1: pos + 1 + cfg.prefetch_ahead])
-                w_ = wins[idx]
+            for idx in order:
+                w_ = wins.get(idx)
+                if w_ is None:
+                    continue
                 fu0, fv0, fw, fh_ = w_
+                if fv0 + fh_ <= v0t or fv0 >= v0t + th:
+                    continue                      # 이 타일과 안 겹침
                 img = load(idx)
                 if img is None:
                     continue
@@ -858,11 +849,6 @@ def mosaic_frames(frames: list[FrameHomography],
             del canvas, score
             if (t + 1) % 5 == 0 or t == n_tiles - 1:
                 logger.info("  타일 %d/%d 완료", t + 1, n_tiles)
-
-    if _pool is not None:
-        for f_ in _futures.values():
-            f_.cancel()
-        _pool.shutdown(wait=False)
 
     fill_ratio = filled_total / float(out_w * out_h)
     logger.info("모자이크 저장: %s (%d장 합성, 충전율 %.1f%%)",

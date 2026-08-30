@@ -59,6 +59,8 @@ from .ortho import MosaicConfig, mosaic_frames, orthorectify_frame, warp_frame
 from .pairing import footprint_radius_m, select_gps_neighbor_pairs
 from .frames import FrameContext, FrameSet, FrameSetConfig
 from .plane import estimate_ground_plane, fit_plane_ransac
+from .plane_calib import (apply_calibration, calibrate_plane,
+                          estimate_plane_height_from_overlaps)
 from .pose import (
     angle_from_nadir_deg,
     camera_axes_enu,
@@ -91,6 +93,7 @@ __all__ = [
     "footprint_radius_m", "select_gps_neighbor_pairs",
     # 평면
     "fit_plane_ransac", "estimate_ground_plane",
+    "calibrate_plane", "estimate_plane_height_from_overlaps", "apply_calibration",
     # 정사영상
     "MosaicConfig", "warp_frame", "orthorectify_frame", "mosaic_frames",
     # 파이프라인
