@@ -66,7 +66,8 @@ def estimate_radial_distortion(observations,
                                points: np.ndarray,
                                f_px: float, cx: float, cy: float,
                                *,
-                               use_k2: bool = True,
+                               use_k2: bool = False,
+                               min_explained: float = 0.05,
                                max_abs_resid_px: float = 40.0,
                                min_obs: int = 5000,
                                clip_k1: float = 0.30
@@ -123,25 +124,34 @@ def estimate_radial_distortion(observations,
     else:
         A = (rr * x ** 2)[:, None]
 
-    # IRLS 로 이상치 억제.
+    # ★ k1 과 k2 를 함께 풀면 심하게 상관돼 병적인 해가 나온다.
+    #   실측에서 k1=-0.0269, k2=+0.3039 가 나왔는데, 두 항이 중간 반경에서
+    #   서로 상쇄하다가 모서리(r=3240)에서 k2 가 +44 px 로 폭주했다.
+    #   기본은 **k1 단독**으로 푼다 (use_k2=True 로 명시할 때만 2항).
+    #   절편(반경 무관 바닥)도 함께 두어야 바닥을 왜곡으로 오해하지 않는다.
+    A = np.concatenate([np.ones((len(rr), 1)), A], axis=1)
+
     w = np.ones(len(rr))
     coef = np.zeros(A.shape[1])
     for _ in range(4):
         Aw = A * w[:, None]
         coef, *_ = np.linalg.lstsq(Aw, d_rad * w, rcond=None)
         res = d_rad - A @ coef
-        s = 1.4826 * np.median(np.abs(res - np.median(res))) + 1e-9
-        w = np.minimum(1.0, 2.0 * s / np.maximum(np.abs(res), 1e-9))
+        sc = 1.4826 * np.median(np.abs(res - np.median(res))) + 1e-9
+        w = np.minimum(1.0, 2.0 * sc / np.maximum(np.abs(res), 1e-9))
 
-    k1 = float(coef[0])
-    k2 = float(coef[1]) if use_k2 else 0.0
+    k1 = float(coef[1])
+    k2 = float(coef[2]) if use_k2 else 0.0
     if not np.isfinite(k1) or abs(k1) > clip_k1:
         logger.warning("방사 왜곡 추정 기각: k1=%.4f 가 타당 범위 ±%.2f 밖",
                        k1, clip_k1)
         return None
 
-    before = float(np.median(np.abs(d_rad)))
+    # 설명률은 '절편만 뺀 상태' 대비 '왜곡항까지 뺀 상태' 로 잰다.
+    base = d_rad - coef[0]
+    before = float(np.median(np.abs(base)))
     after = float(np.median(np.abs(d_rad - A @ coef)))
+    explained = 1.0 - after / max(before, 1e-9)
     r_corner = float(np.percentile(rr, 99))
     info = {
         "k1": k1, "k2": k2,
@@ -156,10 +166,26 @@ def estimate_radial_distortion(observations,
                 "반경 잔차 중앙값 %.2f → %.2f px, 모서리 왜곡 %.1f px",
                 k1, k2, info["n_obs"], before, after,
                 info["corner_distortion_px"])
-    if after > before * 0.8:
-        logger.warning("  왜곡 모델로 설명되는 부분이 적습니다 "
-                       "(%.2f → %.2f px). 잔차의 주원인이 왜곡이 아닐 수 "
-                       "있으니 적용 결과를 확인하세요.", before, after)
+    info["explained_fraction"] = explained
+    # ★ '설명률' 로 판정하면 안 된다. 반경 무관 바닥이 크면 **완벽한 보정조차**
+    #   중앙값 기준 설명률이 30% 를 넘지 못한다 (시뮬레이션: 바닥 σ=1.6 px 일 때
+    #   완벽 보정 31%, σ=1.2 px 일 때 40%). 실측 12~15% 는 '왜곡이 없다' 가
+    #   아니라 '바닥이 크다' 는 뜻이었고, 내 하한 25% 는 사실상 왜곡 보정을
+    #   영구히 막는 기준이었다.
+    #
+    #   판정은 **구간별 중앙값 적합**(diagnose_residual_vs_radius) 이 한다.
+    #   거기서는 바닥 잡음이 평균되어 사라지므로 R²=0.92~0.95 로 깨끗하게
+    #   갈린다. 여기서는 '부호가 뒤집히거나 개선이 전혀 없는' 명백한 실패만
+    #   거른다.
+    if explained < min_explained:
+        logger.warning("  방사 왜곡 추정 기각: 반경 잔차가 전혀 줄지 않습니다 "
+                       "(%.0f%% < %.0f%%). 계수를 적용하지 않습니다.",
+                       explained * 100, min_explained * 100)
+        return None
+    logger.info("  반경 잔차 설명률 %.0f%% (적용). 반경 무관 바닥이 크면 이 "
+                "값은 원래 낮게 나옵니다 — 완벽한 보정도 바닥 σ=1.6 px 에서는 "
+                "31%% 가 한계입니다. 판정은 구간별 적합이 합니다.",
+                explained * 100)
     return k1, k2, info
 
 

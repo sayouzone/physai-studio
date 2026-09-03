@@ -220,13 +220,17 @@ def run_homography_pipeline(image_dir: Path,
                  ba_stage1_attitude_deg: float = 1.5,
                  seam_optimize: bool = True,
                  seam_cost_weight: float = 1.0,
+                 seam_panel_penalty: float = 2.0,
                  exposure_compensate: bool = True,
                  glint_penalty: float = 0.7,
                  tile_memory_mb: float = 256.0,
+                 prefetch_workers: int = 4,
                  max_offnadir_ratio: float = 0.35,
                  offnadir_auto: bool = True,
                  offnadir_frac: float = 0.65,
                  offnadir_fallback: bool = True,
+                 offnadir_tolerance: float = 1.15,
+                 offnadir_epsilon: float = 0.002,
                  auto_focal: bool = True,
                  focal_tolerance: float = 0.01,
                  focal_max_rounds: int = 4,
@@ -246,10 +250,16 @@ def run_homography_pipeline(image_dir: Path,
                  tri_z_band_m: float = 25.0,
                  fine_tri_angle_deg: float = 5.0,
                  use_dsm: bool = True,
+                 layer_surface: bool = False,
+                 layer_gap_m: float = 0.0,
+                 layer_cell_m: float = 0.5,
+                 use_two_layer: bool = True,
+                 two_layer_min_area_m2: float = 3.0,
                  dsm_max_relief_m: float = 6.0,
                  dsm_cell_m: float = 0.8,
                  rtk_boost_max: float = 8.0,
                  plane_lrf_tolerance_m: float = 3.0,
+                 plane_shift_limit_m: float = 3.0,
                  glob_pattern: str = "*.JPG") -> dict:
     """전체 파이프라인 실행.
 
@@ -779,7 +789,9 @@ def run_homography_pipeline(image_dir: Path,
                     for f, _ in keep]
 
         plane_new, cal = calibrate_plane(
-            _rebuild, [m.origin_path for _, m in keep], plane)
+            _rebuild, [m.origin_path for _, m in keep], plane,
+            total_limit_m=plane_shift_limit_m,
+            max_shift_m=plane_shift_limit_m)
         # 사후 검증 — 보정 결과가 LRF/메타데이터 기준에서 크게 벗어나면 되돌린다.
         ref_zs2 = [z for z in (estimate_ground_z(m) for m in metas)
                    if z is not None]
@@ -789,11 +801,20 @@ def run_homography_pipeline(image_dir: Path,
             cy2 = float(np.mean([f.camera_xyz[1] for f in frames]))
             gap2 = float(plane_new.height_at(cx2, cy2)) - float(np.median(ref_zs2))
             if abs(gap2) > plane_lrf_tolerance_m:
+                # ★ 관문이 둘이라는 것을 명시한다.
+                #   --plane-shift-limit 만 올리면 여기서 되돌려져 **아무 일도
+                #   일어나지 않는다.** 실측(극동대 TM)에서 겹침 기반 추정이
+                #   24쌍 중 23쌍에서 ±0.41 m 로 일관되게 -6.24 m 를 가리켰는데,
+                #   그 값을 적용하려면 이 허용치도 함께 풀어야 한다.
                 logger.warning(
                     "기준면 자동보정 결과(%.2f m)가 LRF 기준에서 %+.2f m 벗어나 "
                     "되돌립니다 (허용 ±%.1f m). 기준면은 지면과 구조물 상단 "
-                    "사이에만 있을 수 있습니다.",
-                    plane_new.height_at(cx2, cy2), gap2, plane_lrf_tolerance_m)
+                    "사이에만 있을 수 있습니다. — 겹침 기반 추정을 실제로 "
+                    "적용하려면 **--plane-shift-limit 과 --plane-lrf-tolerance "
+                    "를 함께** %.0f 이상으로 주세요 (한쪽만 올리면 여기서 "
+                    "되돌려집니다).",
+                    plane_new.height_at(cx2, cy2), gap2, plane_lrf_tolerance_m,
+                    abs(gap2) + 1)
                 ok = False
         if ok and cal is not None and abs(plane_new.c - plane.c) > 1e-6:
             logger.info("기준면 자동보정: %.2f m → %.2f m (Δ%+.2f m)",
@@ -815,7 +836,40 @@ def run_homography_pipeline(image_dir: Path,
     #   성긴 DSM(0.8 m 격자) 이면 층을 구분하기에 충분하다.
     dsm_obj = None
     dsm_reject = None
-    if use_dsm and pts_opt is not None and len(pts_opt) >= 5000:
+
+    # ---- 2층 표면 모델 (연속 DSM 의 대안) -----------------------------
+    # ★ 현재 병목은 BA 가 아니라 단일 평면이다:
+    #     정밀 단계 재투영 잔차 중앙값 2.11 px = 지상 1.4 cm
+    #     그런데 모자이크 안쪽 어긋남은 3.9 cm
+    #   차이는 기준면과 실제 표면의 높이차가 만드는 기복변위 Δh·k 다.
+    #   기준면이 패널 상면이므로 **지면층이 0.96 m 아래**에 있고,
+    #   k=0.15 에서 14 cm, k=0.304 에서 29 cm 밀린다.
+    #
+    #   연속 DSM 은 셀당 10개 이상을 못 채워 실패했지만(충전율 26.6%),
+    #   이 장면의 높이는 연속이 아니라 **두 값 중 하나**다. 이진 다수결은
+    #   셀당 3~5개면 성립한다 (셀 0.5 m 에서 3.6개).
+    if layer_surface and pts_opt is not None and len(pts_opt) >= 5000:
+        gap = float(getattr(plane, "upper_layer_shift_m", 0.0) or 0.0)
+        if gap <= 0.05:
+            gap = float(layer_gap_m)
+        if gap > 0.05:
+            from .homography.dsm import build_layer_surface
+            fb = [f.footprint_bounds() for f in frames]
+            fb = [x for x in fb if x is not None]
+            if fb:
+                arr = np.array(fb)
+                dsm_obj = build_layer_surface(
+                    pts_opt,
+                    (float(arr[:, 0].min()), float(arr[:, 1].min()),
+                     float(arr[:, 2].max()), float(arr[:, 3].max())),
+                    plane, gap, cell_m=layer_cell_m)
+                if dsm_obj is None:
+                    dsm_reject = {"reason": "layer_surface_failed"}
+        else:
+            logger.info("2층 표면 생략 — 층 간격을 알 수 없습니다 "
+                        "(--layer-gap 으로 지정 가능).")
+    if dsm_obj is None and use_dsm and pts_opt is not None \
+            and len(pts_opt) >= 5000:
         from .homography.dsm import build_dsm
         fb = [f.footprint_bounds() for f in frames]
         fb = [x for x in fb if x is not None]
@@ -856,6 +910,53 @@ def run_homography_pipeline(image_dir: Path,
         logger.info("DSM 생략 — BA 점군이 %d개로 부족합니다 (5000개 이상 필요). "
                     "단일 평면을 사용합니다.", n_pts_have)
         dsm_reject = {"reason": "too_few_points", "n_points": n_pts_have}
+
+    # ---- 2층 높이맵 빌더 -------------------------------------------------
+    # ★ 남은 어긋남은 하나의 식으로 설명된다: Δh × k
+    #   (Δh = 기준면과 지면의 높이차, k = 그 자리 off-nadir).
+    #   실측에서 안쪽 0.039 / 중간 0.107 / 바깥 0.398 m 를 Δh=1.23 m 로 나누면
+    #   k = 0.032 / 0.087 / 0.323 이 나오고, 마지막 값은 연직 제한 상한
+    #   0.304 와 사실상 같다. **세 영역이 모두 맞는다.**
+    #   즉 BA·초점·왜곡이 아니라 '평면 하나로 두 층을 덮은 것' 이 남은
+    #   오차의 거의 전부다.
+    #
+    #   BA 점군 DSM 은 점이 텍스처에 뭉쳐 충전율 26.6% 로 실패했지만,
+    #   **높이는 이미 알고 있다** — 패널 상면은 기준면이고 지면은 그보다
+    #   plane_above_ground_m 아래다. 필요한 건 "어느 픽셀이 패널인가" 뿐이고
+    #   그건 영상에서 분할하면 된다 (실측 정사영상에서 Otsu 만으로 패널
+    #   면적의 97% 가 5㎡ 초과 덩어리로 잡힘).
+    _ground_drop_hint = 0.0
+    if ref_ground_z is not None and plane is not None:
+        _cxh = float(np.mean([f_.camera_xyz[0] for f_ in frames]))
+        _cyh = float(np.mean([f_.camera_xyz[1] for f_ in frames]))
+        _ground_drop_hint = float(plane.height_at(_cxh, _cyh)) - ref_ground_z
+
+    _tl_builder = None
+    if use_two_layer and dsm_obj is None:
+        # ★ 점군이 아는 '상층(패널) 비율' 을 분할 보정의 목표로 넘긴다.
+        #   점군은 높이를 직접 재므로 영상 밝기보다 신뢰할 수 있다.
+        _upper_frac = None
+        if pts_opt is not None and len(pts_opt) > 1000 and plane is not None:
+            _rz = pts_opt[:, 2] - plane.height_at(pts_opt[:, 0], pts_opt[:, 1])
+            _up = int(np.sum(np.abs(_rz) <= 0.35))
+            _lo = int(np.sum(np.abs(_rz + max(_ground_drop_hint, 0.05)) <= 0.35))
+            if _up + _lo > 500:
+                _upper_frac = _up / float(_up + _lo)
+        _ground_drop = 0.0
+        if ref_ground_z is not None:
+            _cx = float(np.mean([f_.camera_xyz[0] for f_ in frames]))
+            _cy = float(np.mean([f_.camera_xyz[1] for f_ in frames]))
+            _ground_drop = float(plane.height_at(_cx, _cy)) - ref_ground_z
+
+        def _tl_builder(coarse_gray, coarse_ok, bnds, cell):
+            if coarse_gray is None:
+                return None
+            from .homography.two_layer import build_two_layer_dsm
+            return build_two_layer_dsm(
+                coarse_gray, coarse_ok, bnds, cell, plane,
+                ground_drop_m=_ground_drop,
+                min_area_m2=two_layer_min_area_m2,
+                target_fraction=_upper_frac)
 
     if gsd_m is None:
         gsd_m = recommend_gsd(frames)
@@ -908,14 +1009,19 @@ def run_homography_pipeline(image_dir: Path,
                               cfg=MosaicConfig(
                                   seam_optimize=seam_optimize,
                                   seam_cost_weight=seam_cost_weight,
+                                  seam_panel_penalty=seam_panel_penalty,
                                   exposure_compensate=exposure_compensate,
                                   glint_penalty=glint_penalty,
                                   tile_memory_mb=tile_memory_mb,
+                                  prefetch_workers=prefetch_workers,
                                   max_offnadir_ratio=max_offnadir_ratio,
                                   offnadir_auto=offnadir_auto,
                                   offnadir_frac=offnadir_frac,
                                   offnadir_fallback=offnadir_fallback,
-                                  dsm=dsm_obj))
+                                  offnadir_tolerance=offnadir_tolerance,
+                                  offnadir_epsilon=offnadir_epsilon,
+                                  dsm=dsm_obj,
+                                  two_layer_builder=_tl_builder))
     else:
         n_ok = 0
         for fh, m in zip(frames, frame_metas):
@@ -926,6 +1032,21 @@ def run_homography_pipeline(image_dir: Path,
         stats = {"frames_ok": n_ok, "frames_failed": len(frames) - n_ok,
                  "gsd_m": gsd_m}
     logger.info("[stage] 정사영상: %s", fmt_elapsed(time.perf_counter() - t0))
+
+    # ---- 모자이크 품질 자체 진단 --------------------------------------
+    # ★ 그동안 품질을 '중심으로부터 거리별 어긋남' 으로 봤는데 그 지표가
+    #   오도했다. 바깥 밴드는 잔디·도로이고 극단적 off-nadir 로 채워진
+    #   곳이라 검사 품질을 대표하지 못한다. 실제로 픽셀별 상한을 넣었을 때
+    #   바깥은 0.427 → 0.563 m 로 나빠졌지만 **패널만 보면 0.087 → 0.078 m
+    #   로 좋아졌다.** 검사 대상에서의 어긋남을 직접 재서 남긴다.
+    if mosaic and stats.get("output_path"):
+        try:
+            from .homography.mosaic_qc import assess_mosaic
+            qc = assess_mosaic(stats["output_path"], stats.get("gsd_m", gsd_m))
+            if qc:
+                stats["quality"] = qc
+        except Exception as exc:
+            logger.warning("품질 진단 실패 (계속 진행): %s", exc)
 
     summary = {
         "images": len(metas),
@@ -938,7 +1059,19 @@ def run_homography_pipeline(image_dir: Path,
         "plane_tilt_check": plane_tilt,
         "focal_calibration": focal_info,
         "distortion": distortion_info,
-        "dsm_used": dsm_obj is not None,
+        # ★ ortho 단계 안에서 two_layer_builder 가 별도로 높이맵을 만들 수
+        #   있는데, 이 상위 필드들이 그것을 반영하지 않았다. 실측
+        #   summary.json 에서 `surface_model: "plane"` 인데 동시에
+        #   `ortho.dsm.coverage: 1.0`, `relief_p99_m: 2.67` 이 찍혀
+        #   **평면을 썼다고 잘못 읽히는** 상태였다. 실제 사용된 표면으로
+        #   보고한다.
+        "dsm_used": (dsm_obj is not None
+                     or bool(stats.get("dsm"))),
+        "surface_model": (
+            "layer" if (dsm_obj is not None and layer_surface)
+            else "dsm" if dsm_obj is not None
+            else "two_layer" if stats.get("dsm")
+            else "plane"),
         "dsm_rejected": dsm_reject,
         "ground_plane": {
             "a": plane.a, "b": plane.b, "c": plane.c,

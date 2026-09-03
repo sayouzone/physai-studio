@@ -95,6 +95,7 @@ def estimate_focal_scale(metas, cams_opt, points_xyz,
                          min_points_per_frame: int = 50,
                          search_radius_m: float = 12.0,
                          clip: tuple[float, float] = (0.6, 1.6),
+                         max_single_correction: float = 0.08,
                          damping: float = 0.7
                          ) -> tuple[float, dict] | None:
     """``f_px`` 오차 배율 추정. ``f_px_corrected = f_px / scale``.
@@ -173,6 +174,35 @@ def estimate_focal_scale(metas, cams_opt, points_xyz,
                        "크거나 점군에 이상치가 많습니다. 보정을 건너뜁니다.",
                        spread)
         return None
+    # ★ 메타데이터 거리 자체가 틀렸을 때를 거른다.
+    #   이 보정은 메타데이터 거리를 **정답으로 가정**한다. DJI
+    #   ``RelativeAltitude`` 는 **이륙 지점 기준** 상대고도이므로, 이륙점이
+    #   촬영 부지와 높이가 다르면 그 차이만큼 통째로 틀린다.
+    #
+    #   실측(극동대): 메타데이터가 33.19 m 라고 했지만 실제는 약 40 m 였다.
+    #   보정 루프가 그 틀린 값을 목표로 4회 돌며 f_px 를 2704 → 3232
+    #   (+19.5%) 로 부풀렸고 최종 검증 잔차가 +20.3% 로 남았다. 세
+    #   센서(광각/줌/열화상)가 독립적으로 BA 평면을 -7.8~-8.0 m 로 가리킨
+    #   것이 같은 이야기다.
+    #
+    #   한 번에 10% 를 넘는 보정이 필요하다는 것은 **광학이 아니라 기준이
+    #   틀렸다**는 신호다. 정상 사례(그린환경센터)는 2.4% 였다.
+    #   판정은 **감쇠 전 원값(raw)** 으로 한다. 감쇠(0.7배)를 거친 값으로 재면
+    #   실측 극동대가 12.1% → 8.5% 로 줄어 한계를 통과해 버린다.
+    if abs(1.0 - raw) > max_single_correction:
+        _dt = info.get("d_triangulated_median_m", float("nan"))
+        _dm = info.get("d_metadata_median_m", float("nan"))
+        logger.warning(
+            "  초점거리 보정 기각: 한 번에 %.1f%% 보정이 필요합니다 "
+            "(한계 %.0f%%). 이 크기는 렌즈가 아니라 **메타데이터 고도 기준**이 "
+            "틀렸다는 신호입니다 — DJI RelativeAltitude 는 이륙 지점 기준이라 "
+            "이륙점이 촬영 부지와 높이가 다르면 그만큼 통째로 어긋납니다. "
+            "삼각측량 %.2f m vs 메타데이터 %.2f m (차이 %.2f m). "
+            "실제 비행고도를 확인하세요.",
+            abs(1.0 - raw) * 100, max_single_correction * 100,
+            _dt, _dm, _dm - _dt)
+        return None
+
     if not (clip[0] <= scale <= clip[1]):
         logger.warning("  배율 %.3f 가 타당 범위 %.1f~%.1f 를 벗어납니다 — "
                        "초점거리가 아니라 다른 것이 잘못됐을 수 있습니다. "

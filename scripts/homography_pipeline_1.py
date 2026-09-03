@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
         if os.path.exists(path):
             return path
         raise FileNotFoundError(filepath)
- 
+
     p = argparse.ArgumentParser(
         description="Homography 파이프라인 (RTK 기반 호모그래피)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -104,6 +104,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--coarse-reproj", dest="coarse_reproj_px", type=float,
                    default=0.0,
                    help="1차 삼각측량 게이트 (px). 0 이면 --attitude-deg 로 자동")
+    p.add_argument("--fixed-fine-gate", dest="fine_gate_auto",
+                   action="store_false",
+                   help="정밀 게이트를 --fine-reproj 값으로 고정. 기본은 측정된 "
+                        "잔차 프로파일(바닥+반경성분)에서 자동 결정 — 상수 3px "
+                        "게이트가 반경 1814px 바깥을 통째로 잘라 점의 절반을 "
+                        "잃고 있었다")
+    p.add_argument("--fine-gate-max", dest="fine_gate_max_px", type=float,
+                   default=8.0, help="자동 결정된 정밀 게이트의 상한 (px)")
+    p.add_argument("--no-auto-distortion", dest="auto_distortion",
+                   action="store_false",
+                   help="진단이 왜곡을 확인해도 자동 보정하지 않는다. 기본은 "
+                        "자동 — 실측에서 잔차가 '바닥 1.72px + 왜곡 3.87px' 로 "
+                        "확인됐고(R²=0.985), 3px 게이트가 반경 1814px 바깥을 "
+                        "통째로 버리고 있었다")
+    p.add_argument("--distortion-k2", dest="distortion_use_k2",
+                   action="store_true",
+                   help="왜곡을 k1,k2 두 항으로 푼다. 기본은 k1 단독 — 실측에서 "
+                        "두 항을 함께 풀자 k1=-0.0269, k2=+0.3039 로 서로 "
+                        "상쇄하다 모서리에서 +44px 폭주하는 병적인 해가 나왔다")
+    p.add_argument("--estimate-distortion", dest="estimate_distortion",
+                   action="store_true",
+                   help="재투영 잔차에서 방사 왜곡(k1,k2)을 추정해 보정한다. "
+                        "이 데이터는 DewarpData 가 없어 왜곡이 미보정 상태다. "
+                        "로그의 '잔차의 반경 의존성' 진단에서 3승 패턴이 "
+                        "확인되면 켤 것. 기본은 꺼짐(미검증)")
+    p.add_argument("--mid-reproj-factor", dest="mid_reproj_factor", type=float,
+                   default=3.0,
+                   help="중간 게이트 = 현재 BA RMSE × 이 배수. 느슨(700px)에서 "
+                        "정밀(3px)로 바로 가면 정상 점까지 잘린다 (실측: 점 34%%, "
+                        "관측 59%% 손실). 0 이면 중간 단계 없음")
     p.add_argument("--fine-reproj", dest="fine_reproj_px", type=float,
                    default=3.0, help="2차(정밀) 삼각측량 게이트 (px)")
     p.add_argument("--min-tri-angle", dest="fine_tri_angle_deg", type=float,
@@ -141,6 +171,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--attitude-sigma", dest="attitude_sigma_deg", type=float,
                    default=1.0,
                    help="자세 prior 표준편차 (deg). 짐벌 절대 정확도 수준")
+    p.add_argument("--no-cache", dest="use_feature_cache",
+                   action="store_false",
+                   help="SIFT 특징점·매칭 캐시를 쓰지 않는다. 기본은 사용 — "
+                        "이 단계가 전체의 48%% 인데 이미지가 같으면 결과가 "
+                        "항상 같다. 출력 폴더의 .feature_cache/ 에 저장")
+    p.add_argument("--check-version", action="store_true",
+                   help="CLI 와 pipeline.py 의 기능 일치 여부만 확인하고 종료")
+    p.add_argument("--coarse-ba-ftol", dest="coarse_ba_ftol", type=float,
+                   default=1e-4,
+                   help="느슨/중간 BA 단계의 조기 종료 기준. 이 단계는 수렴이 "
+                        "목적이 아니라 다음 게이트가 쓸 만한 수준까지 내리는 "
+                        "것이 목적이다. 0 이면 조기 종료 없음")
     p.add_argument("--ba-max-nfev", dest="ba_max_nfev", type=int, default=200,
                    help="BA 단계별 최대 함수평가 횟수")
     p.add_argument("--tri-z-band", dest="tri_z_band_m", type=float, default=25.0,
@@ -172,6 +214,11 @@ def parse_args() -> argparse.Namespace:
                         "없음. 중복이 낮은 현장은 0.40~0.45 로 완화")
     p.add_argument("--rtk-boost", dest="rtk_boost_max", type=float, default=8.0,
                    help="관측이 적은(가장자리) 프레임의 RTK prior 가중 강화 상한")
+    p.add_argument("--prefetch-workers", dest="prefetch_workers", type=int,
+                   default=4,
+                   help="모자이크에서 원본 이미지를 미리 읽는 스레드 수 (0=끔). "
+                        "20MP JPEG 디코딩이 장당 0.34초로 모자이크 비용의 "
+                        "대부분이고, 스레드로 약 1.5배 빨라진다")
     p.add_argument("--tile-memory", dest="tile_memory_mb", type=float,
                    default=256.0,
                    help="모자이크 타일 하나의 메모리 예산 (MB). 출력이 아무리 "
@@ -203,7 +250,15 @@ def main() -> None:
     )
 
     start = time.perf_counter()
-    summary = run_homography_pipeline(
+    wall_start = time.time()
+    # ★ 버전 불일치 방어.
+    #   CLI 는 새 버전인데 pipeline.py 가 이전 버전이면
+    #   TypeError: unexpected keyword argument 로 죽는다 (실제 발생).
+    #   설치 경로가 달라 파일을 수동으로 옮기는 환경에서는 흔한 일이므로,
+    #   함수가 받지 못하는 인자는 **경고만 하고 떨어뜨린다**. 그러면 새
+    #   기능만 빠진 채로 정상 실행된다 — 40분짜리 실행이 인자 하나 때문에
+    #   시작도 못 하는 일이 없어진다.
+    _kwargs = dict(
         image_dir=args.image_dir,
         output_dir=args.output_dir,
         target_epsg=args.epsg,
@@ -219,12 +274,18 @@ def main() -> None:
         auto_plane=args.auto_plane,
         coarse_reproj_px=args.coarse_reproj_px,
         fine_reproj_px=args.fine_reproj_px,
+        mid_reproj_factor=args.mid_reproj_factor,
+        estimate_distortion=args.estimate_distortion,
+        auto_distortion=args.auto_distortion,
+        fine_gate_auto=args.fine_gate_auto,
+        fine_gate_max_px=args.fine_gate_max_px,
         ba_stage1_attitude_deg=args.ba_stage1_attitude_deg,
         seam_optimize=args.seam_optimize,
         seam_cost_weight=args.seam_cost_weight,
         exposure_compensate=args.exposure_compensate,
         glint_penalty=args.glint_penalty,
         tile_memory_mb=args.tile_memory_mb,
+        prefetch_workers=args.prefetch_workers,
         max_offnadir_ratio=args.max_offnadir_ratio,
         rtk_boost_max=args.rtk_boost_max,
         plane_lrf_tolerance_m=args.plane_lrf_tolerance_m,
@@ -234,6 +295,8 @@ def main() -> None:
         plane_tilt_tolerance_deg=args.plane_tilt_tolerance_deg,
         focal_max_total=args.focal_max_total,
         ba_max_nfev=args.ba_max_nfev,
+        coarse_ba_ftol=args.coarse_ba_ftol,
+        use_feature_cache=args.use_feature_cache,
         tri_z_band_m=args.tri_z_band_m,
         focal_max_rounds=args.focal_max_rounds,
         fine_tri_angle_deg=args.fine_tri_angle_deg,
@@ -245,8 +308,40 @@ def main() -> None:
         dsm_cell_m=args.dsm_cell_m,
         glob_pattern=args.glob_pattern,
     )
+
+    import inspect
+    _accepted = set(inspect.signature(run_homography_pipeline).parameters)
+    if args.check_version:
+        import solar_thermal.georeferencing.pipeline as _pm
+        print(f"pipeline.py: {getattr(_pm, '__file__', '?')}")
+        _need = ["coarse_ba_ftol", "fine_gate_auto", "auto_distortion",
+                 "estimate_distortion", "mid_reproj_factor", "fix_positions",
+                 "plane_tilt_tolerance_deg", "offnadir_frac", "auto_focal"]
+        for _k in _need:
+            print(f"  {_k:26} {'있음' if _k in _accepted else '없음 ← 갱신 필요'}")
+        raise SystemExit(0)
+    _dropped = sorted(k for k in _kwargs if k not in _accepted)
+    if _dropped:
+        logging.warning(
+            "pipeline.py 가 지원하지 않는 인자 %d개를 무시합니다: %s — "
+            "CLI 와 pipeline.py 버전이 다릅니다. 두 파일을 같은 배포본에서 "
+            "가져오면 해당 기능이 활성화됩니다.",
+            len(_dropped), ", ".join(_dropped))
+        for k in _dropped:
+            _kwargs.pop(k)
+
+    summary = run_homography_pipeline(**_kwargs)
+
     print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
-    print(f"Elapsed: {timedelta(seconds=int(time.perf_counter() - start))}")
+    _cpu = time.perf_counter() - start
+    _wall = time.time() - wall_start
+    print(f"Elapsed: {timedelta(seconds=int(_cpu))}")
+    # ★ macOS 에서 time.perf_counter() 는 시스템 슬립 동안 진행하지 않는다.
+    #   실제로 모자이크 단계가 벽시계 86분인데 측정 7m36s 로 찍혀 성능 문제로
+    #   오해할 만한 로그가 나온 적이 있다. 두 값이 크게 다르면 알려준다.
+    if _wall > _cpu * 1.5 + 60:
+        print(f"  (벽시계 {timedelta(seconds=int(_wall))} — 차이는 실행 중 "
+              f"컴퓨터가 절전에 든 시간입니다. 성능 문제가 아닙니다.)")
 
 
 if __name__ == "__main__":

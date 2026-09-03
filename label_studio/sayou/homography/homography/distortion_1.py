@@ -66,7 +66,8 @@ def estimate_radial_distortion(observations,
                                points: np.ndarray,
                                f_px: float, cx: float, cy: float,
                                *,
-                               use_k2: bool = True,
+                               use_k2: bool = False,
+                               min_explained: float = 0.05,
                                max_abs_resid_px: float = 40.0,
                                min_obs: int = 5000,
                                clip_k1: float = 0.30
@@ -123,25 +124,34 @@ def estimate_radial_distortion(observations,
     else:
         A = (rr * x ** 2)[:, None]
 
-    # IRLS 로 이상치 억제.
+    # ★ k1 과 k2 를 함께 풀면 심하게 상관돼 병적인 해가 나온다.
+    #   실측에서 k1=-0.0269, k2=+0.3039 가 나왔는데, 두 항이 중간 반경에서
+    #   서로 상쇄하다가 모서리(r=3240)에서 k2 가 +44 px 로 폭주했다.
+    #   기본은 **k1 단독**으로 푼다 (use_k2=True 로 명시할 때만 2항).
+    #   절편(반경 무관 바닥)도 함께 두어야 바닥을 왜곡으로 오해하지 않는다.
+    A = np.concatenate([np.ones((len(rr), 1)), A], axis=1)
+
     w = np.ones(len(rr))
     coef = np.zeros(A.shape[1])
     for _ in range(4):
         Aw = A * w[:, None]
         coef, *_ = np.linalg.lstsq(Aw, d_rad * w, rcond=None)
         res = d_rad - A @ coef
-        s = 1.4826 * np.median(np.abs(res - np.median(res))) + 1e-9
-        w = np.minimum(1.0, 2.0 * s / np.maximum(np.abs(res), 1e-9))
+        sc = 1.4826 * np.median(np.abs(res - np.median(res))) + 1e-9
+        w = np.minimum(1.0, 2.0 * sc / np.maximum(np.abs(res), 1e-9))
 
-    k1 = float(coef[0])
-    k2 = float(coef[1]) if use_k2 else 0.0
+    k1 = float(coef[1])
+    k2 = float(coef[2]) if use_k2 else 0.0
     if not np.isfinite(k1) or abs(k1) > clip_k1:
         logger.warning("방사 왜곡 추정 기각: k1=%.4f 가 타당 범위 ±%.2f 밖",
                        k1, clip_k1)
         return None
 
-    before = float(np.median(np.abs(d_rad)))
+    # 설명률은 '절편만 뺀 상태' 대비 '왜곡항까지 뺀 상태' 로 잰다.
+    base = d_rad - coef[0]
+    before = float(np.median(np.abs(base)))
     after = float(np.median(np.abs(d_rad - A @ coef)))
+    explained = 1.0 - after / max(before, 1e-9)
     r_corner = float(np.percentile(rr, 99))
     info = {
         "k1": k1, "k2": k2,
@@ -156,10 +166,26 @@ def estimate_radial_distortion(observations,
                 "반경 잔차 중앙값 %.2f → %.2f px, 모서리 왜곡 %.1f px",
                 k1, k2, info["n_obs"], before, after,
                 info["corner_distortion_px"])
-    if after > before * 0.8:
-        logger.warning("  왜곡 모델로 설명되는 부분이 적습니다 "
-                       "(%.2f → %.2f px). 잔차의 주원인이 왜곡이 아닐 수 "
-                       "있으니 적용 결과를 확인하세요.", before, after)
+    info["explained_fraction"] = explained
+    # ★ '설명률' 로 판정하면 안 된다. 반경 무관 바닥이 크면 **완벽한 보정조차**
+    #   중앙값 기준 설명률이 30% 를 넘지 못한다 (시뮬레이션: 바닥 σ=1.6 px 일 때
+    #   완벽 보정 31%, σ=1.2 px 일 때 40%). 실측 12~15% 는 '왜곡이 없다' 가
+    #   아니라 '바닥이 크다' 는 뜻이었고, 내 하한 25% 는 사실상 왜곡 보정을
+    #   영구히 막는 기준이었다.
+    #
+    #   판정은 **구간별 중앙값 적합**(diagnose_residual_vs_radius) 이 한다.
+    #   거기서는 바닥 잡음이 평균되어 사라지므로 R²=0.92~0.95 로 깨끗하게
+    #   갈린다. 여기서는 '부호가 뒤집히거나 개선이 전혀 없는' 명백한 실패만
+    #   거른다.
+    if explained < min_explained:
+        logger.warning("  방사 왜곡 추정 기각: 반경 잔차가 전혀 줄지 않습니다 "
+                       "(%.0f%% < %.0f%%). 계수를 적용하지 않습니다.",
+                       explained * 100, min_explained * 100)
+        return None
+    logger.info("  반경 잔차 설명률 %.0f%% (적용). 반경 무관 바닥이 크면 이 "
+                "값은 원래 낮게 나옵니다 — 완벽한 보정도 바닥 σ=1.6 px 에서는 "
+                "31%% 가 한계입니다. 판정은 구간별 적합이 합니다.",
+                explained * 100)
     return k1, k2, info
 
 
@@ -188,7 +214,7 @@ def undistort_observations(observations, k1: float, k2: float,
 
 def diagnose_residual_vs_radius(observations, cams, points,
                                 f_px: float, cx: float, cy: float,
-                                *, n_bins: int = 6, max_obs: int = 400_000):
+                                *, n_bins: int = 10, max_obs: int = 400_000):
     """재투영 잔차를 **이미지 반경 구간별**로 나눠 보고한다.
 
     이 한 줄짜리 진단이 "잔차 바닥이 렌즈 왜곡인가" 를 결정한다:
@@ -240,26 +266,38 @@ def diagnose_residual_vs_radius(observations, cams, points,
         return None
 
     ctrs = np.array(ctrs); meds = np.array(meds)
-    # r³ 모델 적합 → 함의된 k1
-    A = (ctrs ** 3 / f_px ** 2)[:, None]
-    k1_imp = float(np.linalg.lstsq(A, meds, rcond=None)[0][0])
-    pred = A[:, 0] * k1_imp
+    # ★ 절편(반경 무관 바닥) 을 반드시 함께 적합해야 한다.
+    #   잔차 = '오매칭·잡음이 만드는 바닥' + '왜곡이 만드는 r³ 성분' 의 합인데,
+    #   절편 없이 r³ 만 맞추면 바닥까지 r³ 로 설명하려다 적합이 무너진다.
+    #   실측에서 절편 없는 적합이 R²=0.14 로 "왜곡 아님" 이라 오판했고,
+    #   절편을 넣자 R²=0.985, 바닥 1.72 px + k1=+0.0107 로 깨끗하게 갈렸다.
+    A = np.stack([np.ones_like(ctrs), ctrs ** 3 / f_px ** 2], axis=1)
+    coef = np.linalg.lstsq(A, meds, rcond=None)[0]
+    floor_px = float(coef[0]); k1_imp = float(coef[1])
+    pred = A @ coef
     ss_res = float(np.sum((meds - pred) ** 2))
     ss_tot = float(np.sum((meds - meds.mean()) ** 2)) + 1e-12
     r2 = 1.0 - ss_res / ss_tot
     flat = meds.max() / max(meds.min(), 1e-6)
+    r_max = float(ctrs.max())
+    radial_at_max = abs(k1_imp) * r_max ** 3 / f_px ** 2
 
     logger.info("재투영 잔차의 반경 의존성 (왜곡 판별):")
     for line in rows:
         logger.info(line)
-    logger.info("    → 최대/최소 비 %.1f배,  r³ 적합 R²=%.2f,  함의 k1=%+.5f",
-                flat, r2, k1_imp)
-    if flat > 3.0 and r2 > 0.8:
-        logger.warning("    ★ 잔차가 반경의 3승으로 자랍니다 — **미보정 렌즈 "
-                       "왜곡**이 잔차 바닥의 주원인입니다. "
-                       "--estimate-distortion 을 켜 보세요.")
-    elif flat < 1.8:
+    logger.info("    → 바닥 %.2f px + 반경성분 (최대 반경에서 %.2f px), "
+                "적합 R²=%.3f, 함의 k1=%+.5f, 최대/최소 비 %.1f배",
+                floor_px, radial_at_max, r2, k1_imp, flat)
+    distorted = (r2 > 0.7 and radial_at_max > max(0.5 * floor_px, 0.8))
+    if distorted:
+        logger.warning("    ★ 반경 성분이 뚜렷합니다 — **미보정 렌즈 왜곡**이 "
+                       "확인됩니다. 바닥(%.2f px)은 오매칭·잡음이고, 그 위에 "
+                       "얹힌 %.2f px 가 왜곡입니다. 왜곡을 펴면 같은 게이트로 "
+                       "훨씬 많은 점이 살아남습니다.", floor_px, radial_at_max)
+    else:
         logger.info("    잔차가 반경과 거의 무관합니다 — 왜곡이 아니라 "
                     "오매칭/자세오차가 주원인입니다.")
     return {"radii": ctrs.tolist(), "median_px": meds.tolist(),
-            "max_over_min": flat, "r3_fit_r2": r2, "implied_k1": k1_imp}
+            "max_over_min": flat, "fit_r2": r2, "implied_k1": k1_imp,
+            "floor_px": floor_px, "radial_at_max_px": radial_at_max,
+            "distortion_detected": bool(distorted)}

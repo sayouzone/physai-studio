@@ -109,11 +109,23 @@ class MosaicConfig:
 
         이 값으로 프레임의 바깥 고리를 아예 쓰지 않으면 그 열화를 막을 수
         있다. 내부는 중복 덕에 손실이 없고, 모자이크 가장자리만 조금 좁아진다.
+    offnadir_auto : ``True`` 면 ``max_offnadir_ratio`` 를 **커버리지에 맞춰
+        자동 조정**한다. 이 값은 프레임 최대 off-nadir 에 상대적인 의미를
+        갖는데, 초점거리가 보정되면 그 최대값이 변한다 (실측: f 보정으로
+        k_max 가 0.479 → 0.552 로 커지자 같은 0.35 제한의 예외율이
+        7.7% → 13.4% 로 뛰었다). 각 픽셀을 덮는 프레임들의 최소 k 를 모아
+        **프레임 최대 k 의 일정 비율**로 잡으면 자동으로 따라간다.
+    offnadir_frac : 자동 모드에서 쓸 비율 (프레임 최대 k 대비). 0.65 면
+        H20T 기준 k ≈ 0.37 로, 원래 의도했던 0.35 와 비슷하다.
     offnadir_fallback : ``True`` 면 제한 때문에 아무 프레임도 덮지 못하는
         픽셀에 한해 제한을 풀어 채운다 (구멍 방지). ``False`` 면 그 부분을
         비운다 — 품질을 우선할 때.
     tile_memory_mb : 타일 하나의 메모리 예산 (MB). 출력이 아무리 커도
         메모리는 이 값으로 묶인다.
+    prefetch_workers : 원본 이미지를 미리 읽는 스레드 수 (0 이면 끔).
+        JPEG 디코딩이 모자이크 비용의 대부분이고 GIL 을 놓으므로, 합성과
+        겹쳐 실행하면 시간이 줄어든다.
+    prefetch_ahead : 몇 장 앞까지 미리 읽을지.
     image_cache : 원본 이미지 LRU 캐시 장수. 한 프레임이 여러 타일에 걸치면
         재사용된다. 늘리면 디코딩이 줄고 메모리는 는다.
     band_count, dtype, max_out_pixels : 출력 형식.
@@ -128,19 +140,28 @@ class MosaicConfig:
                  align_min_response: float = 0.30,
                  seam_optimize: bool = True,
                  seam_cost_weight: float = 1.0,
+                 seam_panel_penalty: float = 2.0,
                  seam_cost_blur_m: float = 1.5,
                  exposure_compensate: bool = True,
                  glint_penalty: float = 0.7,
                  glint_threshold: int = 250,
                  seam_blend_px: float = 0.0,
                  dsm=None,
+                 two_layer_builder=None,
                  max_offnadir_ratio: float = 0.35,
+                 offnadir_auto: bool = True,
+                 offnadir_frac: float = 0.65,
                  offnadir_fallback: bool = True,
+                 offnadir_tolerance: float = 1.15,
+                 offnadir_epsilon: float = 0.002,
                  tile_memory_mb: float = 256.0,
                  image_cache: int = 8,
+                 prefetch_workers: int = 4,
+                 prefetch_ahead: int = 4,
                  band_count: int = 3,
                  dtype=np.uint8,
-                 max_out_pixels: int = MAX_OUT_PIXELS):
+                 max_out_pixels: int = MAX_OUT_PIXELS,
+                 **_unsupported):
         if blend_mode not in _BLEND_MODES:
             raise ValueError(f"blend_mode={blend_mode!r} — {_BLEND_MODES} 중 하나")
         self.blend_mode = blend_mode
@@ -151,16 +172,39 @@ class MosaicConfig:
         self.nadir_falloff = float(np.clip(nadir_falloff, 0.0, 1.0))
         self.seam_optimize = bool(seam_optimize)
         self.seam_cost_weight = float(max(seam_cost_weight, 0.0))
+        self.seam_panel_penalty = float(max(seam_panel_penalty, 0.0))
         self.seam_cost_blur_m = float(max(seam_cost_blur_m, 0.0))
         self.exposure_compensate = bool(exposure_compensate)
         self.glint_penalty = float(np.clip(glint_penalty, 0.0, 1.0))
         self.glint_threshold = int(glint_threshold)
         self.seam_blend_px = float(max(seam_blend_px, 0.0))
         self.dsm = dsm
+        self.two_layer_builder = two_layer_builder
         self.max_offnadir_ratio = float(max(max_offnadir_ratio, 0.0))
+        self.offnadir_auto = bool(offnadir_auto)
+        self.offnadir_frac = float(np.clip(offnadir_frac, 0.2, 1.0))
         self.offnadir_fallback = bool(offnadir_fallback)
+        self.offnadir_tolerance = float(max(offnadir_tolerance, 1.0))
+        self.offnadir_epsilon = float(max(offnadir_epsilon, 0.0))
         self.tile_memory_mb = float(max(tile_memory_mb, 32.0))
         self.image_cache = int(max(image_cache, 1))
+        self.prefetch_workers = int(max(prefetch_workers, 0))
+        self.prefetch_ahead = int(max(prefetch_ahead, 0))
+
+        # ★ 버전 불일치 방어 (내부 경계).
+        #   CLI→pipeline 은 이미 인자를 걸러내지만 pipeline→MosaicConfig
+        #   에서도 같은 일이 났다: pipeline.py 는 새 버전인데 ortho.py 가
+        #   이전 버전이라 `two_layer_builder` 에서 TypeError 로 죽었다.
+        #   파일을 수동으로 옮기는 환경에서는 흔한 일이므로, 모르는 인자는
+        #   경고만 하고 무시한다 — 새 기능만 빠진 채 정상 실행된다.
+        if _unsupported:
+            logger.warning(
+                "ortho.py 가 지원하지 않는 MosaicConfig 인자 %d개를 무시합니다: "
+                "%s — pipeline.py 와 ortho.py 버전이 다릅니다. 두 파일을 같은 "
+                "배포본에서 가져오면 해당 기능이 켜집니다.",
+                len(_unsupported), ", ".join(sorted(_unsupported)))
+            for _k, _v in _unsupported.items():
+                setattr(self, _k, _v)
         self.band_count = int(band_count)
         self.dtype = dtype
         self.max_out_pixels = int(max_out_pixels)
@@ -469,7 +513,67 @@ def _robust_bounds(frames: list[FrameHomography]) -> tuple:
     return (float(x_min), float(y_min), float(x_max), float(y_max)), outliers
 
 
+def _auto_offnadir_ratio(frames, bounds, cfg, coarse_px: int = 1200) -> float:
+    """프레임 최대 off-nadir 의 일정 비율로 제한값을 잡는다.
+
+    ★ 앞선 구현은 "예외율이 목표치가 되도록" 분위수로 정했는데, 실데이터에서
+      **제한을 완전히 무력화**했다. 모자이크 가장자리 밴드가 전체의 5% 를
+      넘으므로 95 분위수가 곧 프레임 최대값이 되어 ``k ≤ 0.5641`` =
+      제한 없음, 예외율 0.0% 가 나왔다. 연직 제한의 이점이 통째로 사라졌다.
+
+      예외율을 목표로 삼은 것이 잘못이었다. 예외 픽셀은 "더 나은 선택지가
+      아예 없는 자리" 이므로 많아도 손해가 아니다. 정작 중요한 것은
+      **선택지가 있는 자리에서 연직에 가까운 쪽을 쓰는 것**이다.
+
+      그래서 규칙을 단순화한다: 제한값 = 프레임 최대 k × ``offnadir_frac``.
+      초점거리가 보정돼 k_max 가 변해도 (실측 0.479 → 0.564) 같은 비율이
+      유지되므로 자동으로 따라간다.
+    """
+    k_max = 0.0
+    for fh in frames:
+        k_max = max(k_max, float(np.hypot(fh.intr.width, fh.intr.height)
+                                 / 2.0 / max(fh.intr.f_px, 1e-6)))
+    if k_max <= 0:
+        return cfg.max_offnadir_ratio
+    ratio = float(np.clip(k_max * cfg.offnadir_frac, 0.15, k_max))
+    logger.info("연직 제한 자동 결정: k ≤ %.3f (프레임 최대 %.3f 의 %.0f%%)",
+                ratio, k_max, cfg.offnadir_frac * 100)
+    return ratio
+
+
+def _min_k_map(frames, bounds, ow: int, oh: int, g: float) -> np.ndarray:
+    """각 출력 픽셀을 덮는 프레임들의 **최소 off-nadir 비 k**.
+
+    이 값이 그 픽셀이 물리적으로 도달할 수 있는 최선이다. 내부는 작고
+    (0.05~0.15), 가장자리는 클 수밖에 없다(0.3~0.47).
+    """
+    x_min, y_min, x_max, y_max = bounds
+    best = np.full((oh, ow), np.inf, dtype=np.float32)
+    for fh in frames:
+        h = float(fh.camera_xyz[2]) - float(
+            fh.plane.height_at(fh.camera_xyz[0], fh.camera_xyz[1]))
+        if h <= 1e-6:
+            continue
+        b = fh.footprint_bounds()
+        if b is None:
+            continue
+        u0 = max(int((b[0] - x_min) / g), 0)
+        u1 = min(int(np.ceil((b[2] - x_min) / g)), ow)
+        v0 = max(int((y_max - b[3]) / g), 0)
+        v1 = min(int(np.ceil((y_max - b[1]) / g)), oh)
+        if u1 <= u0 or v1 <= v0:
+            continue
+        xs = x_min + (np.arange(u0, u1) + 0.5) * g
+        ys = y_max - (np.arange(v0, v1) + 0.5) * g
+        X, Y = np.meshgrid(xs, ys)
+        k = np.hypot(X - fh.camera_xyz[0], Y - fh.camera_xyz[1]) / h
+        sub = best[v0:v1, u0:u1]
+        np.minimum(sub, k.astype(np.float32), out=sub)
+    return best
+
+
 def _coarse_reference(frames, image_paths, order, bounds, cfg,
+                      panel_mask=None,
                       coarse_px: int = 4000, restrict: bool = True):
     """저해상도 사전 패스 — 프레임별 노출 이득 + **전역 기준 영상**.
 
@@ -494,7 +598,52 @@ def _coarse_reference(frames, image_paths, order, bounds, cfg,
     g = max((x_max - x_min) / coarse_px, (y_max - y_min) / coarse_px)
     ow, oh = int((x_max - x_min) / g), int((y_max - y_min) / g)
     if ow < 32 or oh < 32:
-        return {}, None, None
+        return {}, None, None, None, None
+
+    # 픽셀별 허용 k = max(설정 상한, 도달 가능한 최소 k × 여유)
+    k_allow = None
+    X_all = Y_all = None
+    if restrict and cfg.max_offnadir_ratio > 0 and cfg.offnadir_fallback:
+        mk = _min_k_map(frames, bounds, ow, oh, g)
+        # ★ ε 을 더한다. 최소 k 를 만드는 그 프레임은 k_here == min_k 이므로
+        #   등호로 통과해야 하는데, _min_k_map 은 footprint 를 정수 픽셀로
+        #   잘라 계산하고 본 루프는 전체 격자에서 계산해 격자 정렬이 미세하게
+        #   다르다. 부동소수점에서 등호가 깨지면 **그 픽셀이 통째로 버려진다.**
+        #   실측: tolerance 1.0 에서 충전율이 0.912 → 0.760 으로 15%p 손실.
+        #   (1.15 에서는 여유가 오차를 덮어 문제가 보이지 않았다.)
+        #   ε=0.002 의 기복변위 영향은 1.23 m × 0.002 = 2.5 mm 로 무시 가능.
+        k_allow = np.maximum(cfg.max_offnadir_ratio,
+                             mk * cfg.offnadir_tolerance
+                             + cfg.offnadir_epsilon).astype(np.float32)
+        k_allow[~np.isfinite(mk)] = np.inf
+        xs_a = x_min + (np.arange(ow) + 0.5) * g
+        ys_a = y_max - (np.arange(oh) + 0.5) * g
+        X_all, Y_all = np.meshgrid(xs_a, ys_a)
+        n_relaxed = float((k_allow > cfg.max_offnadir_ratio + 1e-6).mean())
+        mk_med = float(np.median(mk[np.isfinite(mk)]))
+        logger.info("픽셀별 연직 상한: %.1f%% 픽셀은 k≤%.2f 로 덮을 수 없어 "
+                    "도달 가능한 최소 k 까지만 완화 (중앙값 %.2f, 최대 %.2f)",
+                    n_relaxed * 100, cfg.max_offnadir_ratio, mk_med,
+                    float(np.max(mk[np.isfinite(mk)])))
+
+        # ★ '최소 k 중앙값' 은 **촬영 밀도의 직접 지표**다. 그 픽셀을 덮는
+        #   프레임 중 가장 연직에 가까운 것이 얼마나 기울었는지를 뜻하므로,
+        #   이 값이 크다는 것은 **어떤 지점도 바로 위에서 찍히지 않았다**는
+        #   말이고, 파이프라인으로는 되돌릴 수 없다.
+        #
+        #   실측 대조:
+        #     그린환경센터 380장/15,000㎡ → 중앙값 0.06, 패널 어긋남 0.055 m
+        #     극동대      199장/15,100㎡ → 중앙값 0.21~0.65, 어긋남 0.55~0.78 m
+        #   기복변위 = 패널높이(약 1.5 m) × k 로 실측과 자릿수가 맞는다
+        #   (Wide: 1.5 × 0.65 = 0.98 m 예측 vs 0.78 m 실측).
+        if mk_med > 0.15:
+            logger.warning(
+                "  ★ 최소 k 중앙값이 %.2f 입니다 — 대부분의 지점이 **연직으로 "
+                "촬영된 적이 없습니다.** 패널 높이 1.5 m 기준 기복변위가 "
+                "%.2f m 로 예상되며, 이는 파이프라인으로 줄일 수 없습니다. "
+                "촬영 밀도를 높이거나(중복도 상향) 비행선 간격을 좁혀야 합니다. "
+                "참고: 정상 사례는 중앙값 0.06 이었습니다.",
+                mk_med, 1.5 * mk_med)
 
     canvas = np.zeros((oh, ow), dtype=np.float32)
     filled = np.zeros((oh, ow), dtype=bool)
@@ -530,20 +679,39 @@ def _coarse_reference(frames, image_paths, order, bounds, cfg,
         wg = w * gains[idx]
 
         # --- 승자 라벨 결정 (기하 점수 × 시임 비용) ---
+        h_cam = float(fh.camera_xyz[2]) - float(
+            fh.plane.height_at(fh.camera_xyz[0], fh.camera_xyz[1]))
+        # k_allow 를 쓰면 판정을 **지상 k 하나로 통일**한다. 이미지 공간
+        # 하드 제한을 함께 걸면 그쪽이 먼저 프레임을 잘라내 픽셀별 완화가
+        # 무력해진다 (실측: 충전율 39% 로 붕괴).
+        _img_restrict = restrict and (k_allow is None)
         sw = build_source_weight(fh.intr.width, fh.intr.height,
                                  fh.intr.cx, fh.intr.cy, cfg,
-                                 f_px=fh.intr.f_px, restrict=restrict)
+                                 f_px=fh.intr.f_px, restrict=_img_restrict)
         sw_s = cv2.resize(sw, None, fx=0.25, fy=0.25,
                           interpolation=cv2.INTER_AREA)
-        if restrict and cfg.max_offnadir_ratio > 0:
+        if _img_restrict and cfg.max_offnadir_ratio > 0:
             sw_s[sw_s <= 0] = 0.0
         wt = cv2.warpPerspective(
             sw_s, (S @ H).astype(np.float64), (ow, oh),
             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
             borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
         wt[~valid] = 0.0
-        if restrict and cfg.max_offnadir_ratio > 0:
+        if _img_restrict and cfg.max_offnadir_ratio > 0:
             valid = valid & (wt > 0)
+
+        # ★ 픽셀별 k 상한. 단순 상수 상한은 가장자리에서 '아무도 못 덮음' →
+        #   예외로 한 번에 최대 k 까지 열림 → 절벽이 된다. 단계로 나눠 봤더니
+        #   단계마다 노출 이득과 시임 판정이 새로 계산돼 **오히려 나빠졌다**
+        #   (바깥 0.427 → 0.480 m, 파손 16.9 → 19.8%).
+        #
+        #   대신 각 픽셀이 도달 가능한 **최소 k** 를 그 픽셀의 상한으로 쓴다.
+        #   한 번의 패스로 끝나므로 이득·시임이 전역적으로 일관되고,
+        #   내부는 그대로 작은 k, 가장자리는 필요한 만큼만 열린다.
+        if k_allow is not None and h_cam > 0:
+            k_here = np.hypot(X_all - fh.camera_xyz[0],
+                              Y_all - fh.camera_xyz[1]) / h_cam
+            valid = valid & (k_here <= k_allow)
         if cfg.glint_penalty > 0:
             wt[wg >= cfg.glint_threshold] *= (1.0 - cfg.glint_penalty)
 
@@ -554,7 +722,22 @@ def _coarse_reference(frames, image_paths, order, bounds, cfg,
             diff[ov] = np.abs(wg[ov] - canvas[ov])
             diff = cv2.blur(diff, (blur_c, blur_c))
             sc = float(np.percentile(diff[ov], 75)) + 1e-3
-            eff = wt * np.exp(-cfg.seam_cost_weight * diff / sc)
+            cost = diff / sc
+            # ★ 차이 영상만으로는 **높이를 모른다.**
+            #   패널 상면은 기준면보다 약 1 m 높아 프레임마다 Δh·k 만큼 다른
+            #   위치에 투영된다. 시임이 그 위를 지나면 그 크기의 단차가 그대로
+            #   보인다. 실측(그린환경센터 RGB) 잘라낸 구간에서 패널 상단
+            #   경계의 열 간 점프를 재니:
+            #       중앙값 0 px, 90% 3 px, **99% 64 px(41 cm), 최대 155 px(99 cm)**
+            #       3 px 초과 점프가 4.9% 의 열에서 발생
+            #   99% 값이 패널 높이 1 m 와 k 의 곱과 자릿수가 맞는다.
+            #   QC 중앙값(0.06 m)은 이 국소 단차를 못 잡고, p90(0.93 m)이 잡는다.
+            #
+            #   그래서 **패널 위를 지나는 시임에 직접 벌점**을 준다. 차이가
+            #   우연히 작아도 패널이면 피하게 만든다.
+            if panel_mask is not None and cfg.seam_panel_penalty > 0:
+                cost = cost + cfg.seam_panel_penalty * panel_mask
+            eff = wt * np.exp(-cfg.seam_cost_weight * cost)
             eff[~valid] = 0.0
 
         better = eff > score
@@ -572,7 +755,7 @@ def _coarse_reference(frames, image_paths, order, bounds, cfg,
     logger.info("전역 라벨맵: %d×%d px (GSD %.3f m), 배정된 프레임 %d개 — "
                 "타일 독립 시임 판정", ow, oh, g,
                 int(len(np.unique(label[label >= 0]))))
-    return gains, label, g
+    return gains, label, g, canvas, filled
 
 
 def mosaic_frames(frames: list[FrameHomography],
@@ -630,6 +813,10 @@ def mosaic_frames(frames: list[FrameHomography],
             f"발산했거나 GSD 가 너무 작습니다 (현재 {gsd_m:.4f} m). "
             f"cfg.max_out_pixels 를 올려 강제할 수도 있습니다.")
 
+    if cfg.offnadir_auto and cfg.max_offnadir_ratio > 0:
+        cfg.max_offnadir_ratio = _auto_offnadir_ratio(frames, bounds, cfg)
+        _WEIGHT_CACHE.clear()
+
     bands = cfg.band_count
     select_mode = cfg.blend_mode == "select"
     order = _frame_order(frames) if select_mode else list(range(len(frames)))
@@ -645,25 +832,65 @@ def mosaic_frames(frames: list[FrameHomography],
                 x_max - x_min, y_max - y_min, n_tiles, tile_h,
                 tile_h * bytes_per_row / 1e6)
 
-    gains, label_map, ref_gsd = _coarse_reference(
+    gains, label_map, ref_gsd, coarse_img, coarse_ok = _coarse_reference(
         frames, image_paths, order, bounds, cfg, restrict=True)
 
-    # ★ 연직 제한으로 아무도 못 덮은 픽셀은 제한을 풀어 한 번 더 채운다.
-    #   내부는 중복이 커서 손실이 없고, 모자이크 가장자리에만 영향을 준다.
+    # ★ 2패스 — 1패스 기준 영상에서 패널을 분할한 뒤 그 마스크로 시임을
+    #   다시 배치한다. 시임이 패널 위를 지나면 Δh·k 만큼의 단차가 그대로
+    #   보인다. 실측(그린환경센터 RGB, 잘라낸 구간)에서 패널 상단 경계의
+    #   열 간 점프를 재니 중앙값 0 px 인데 **99% 가 64 px(41 cm), 최대
+    #   155 px(99 cm)** 이고 4.9% 의 열에서 3 px 초과 점프가 났다.
+    #   QC 중앙값(0.06 m)은 이 국소 단차를 못 잡고 p90(0.93 m)이 잡는다.
+    #
+    #   1패스 결과를 통째로 버리고 다시 만들므로 노출 이득·시임은 여전히
+    #   **한 번만** 결정된다 (앞서 단계적 예외에서 겪은 이득 불일치 없음).
+    if (cfg.seam_panel_penalty > 0 and cfg.seam_optimize
+            and coarse_img is not None and coarse_ok is not None):
+        try:
+            from .two_layer import segment_panels
+            pm = segment_panels(coarse_img, coarse_ok, ref_gsd)
+            frac = float(pm[coarse_ok].mean()) if coarse_ok.any() else 0.0
+            if 0.05 < frac < 0.90:
+                pm_f = cv2.GaussianBlur(pm.astype(np.float32), (0, 0),
+                                        max(0.5 / ref_gsd, 1.0))
+                logger.info("시임 재배치: 패널 %.1f%% 영역에 벌점 %.1f 적용 "
+                            "— 시임이 패널을 피해 잔디·그림자로 흐르게 합니다",
+                            frac * 100, cfg.seam_panel_penalty)
+                gains, label_map, ref_gsd, coarse_img, coarse_ok = \
+                    _coarse_reference(frames, image_paths, order, bounds, cfg,
+                                      panel_mask=pm_f, restrict=True)
+            else:
+                logger.info("시임 재배치 생략 — 패널 면적비 %.1f%% 가 타당 "
+                            "범위를 벗어납니다", frac * 100)
+        except Exception as exc:
+            logger.warning("시임 재배치 실패 (계속 진행): %s", exc)
+
+    # ★ 2층 높이맵은 '단일 평면 저해상도 정사영상' 이 있어야 만들 수 있는데,
+    #   그것이 바로 라벨맵 패스의 부산물이다. 여기서 콜백으로 넘겨 준다.
+    #   (점군이 아니라 영상 분할로 만들므로 점 밀도와 무관하다.)
+    if cfg.two_layer_builder is not None and cfg.dsm is None:
+        try:
+            _tl = cfg.two_layer_builder(coarse_img, coarse_ok, bounds, ref_gsd)
+        except Exception as exc:                       # pragma: no cover
+            logger.warning("2층 높이맵 생성 실패 (단일 평면으로 진행): %s", exc)
+            _tl = None
+        if _tl is not None:
+            cfg.dsm = _tl
+            _WEIGHT_CACHE.clear()
+
+
+    # ★ 예외 처리는 이제 필요 없다.
+    #   픽셀별 k 상한(_min_k_map)이 저해상도 패스 안에서 이미 적용되므로,
+    #   '아무도 못 덮는 픽셀' 자체가 생기지 않는다. 예전처럼 뒤에서 다시
+    #   패스를 돌 이유가 없고, 그 덕에 노출 이득과 시임 판정이 전역적으로
+    #   한 번만 계산된다 (단계별 재계산이 만들던 밝기 단차가 사라진다).
     n_fallback = 0.0
-    if (cfg.max_offnadir_ratio > 0 and cfg.offnadir_fallback
-            and label_map is not None):
-        hole = label_map < 0
-        if hole.any():
-            _, lab_full, _ = _coarse_reference(
-                frames, image_paths, order, bounds, cfg, restrict=False)
-            if lab_full is not None:
-                fill = hole & (lab_full >= 0)
-                n_fallback = float(fill.mean())
-                label_map[fill] = lab_full[fill]
-                logger.info("연직 제한 예외 적용: 전체의 %.1f%% 픽셀은 "
-                            "k>%.2f 영역으로 채움 (그 부분은 기복변위가 크다)",
-                            100.0 * fill.mean(), cfg.max_offnadir_ratio)
+    if label_map is not None and cfg.max_offnadir_ratio > 0:
+        n_fallback = float((label_map < 0).mean())
+        if n_fallback > 0.001 and not cfg.offnadir_fallback:
+            logger.info("연직 제한으로 비운 픽셀: %.1f%% "
+                        "(--offnadir-fallback 를 켜면 도달 가능한 최소 k 로 "
+                        "채웁니다)", n_fallback * 100)
 
     # 프레임별 footprint 를 출력 픽셀 창으로 미리 계산 (타일 교차 판정용).
     wins = {}
@@ -675,16 +902,41 @@ def mosaic_frames(frames: list[FrameHomography],
     maps_cache: dict[tuple, object] = {}
     img_cache: dict[int, np.ndarray] = {}
 
+    def _decode(idx):
+        im = cv2.imread(str(image_paths[idx]), cv2.IMREAD_UNCHANGED)
+        if im is not None:
+            if im.ndim == 3 and im.shape[2] >= 3:
+                im = cv2.cvtColor(im[:, :, :3], cv2.COLOR_BGR2RGB)
+            elif im.ndim == 2 and bands == 3:
+                im = cv2.cvtColor(im, cv2.COLOR_GRAY2RGB)
+        return im
+
+    # ★ 모자이크가 남은 최대 비용이다 (실측 21m15s 중 7m36s).
+    #   비용의 대부분은 **JPEG 디코딩**이다 — 프레임이 걸치는 타일마다 다시
+    #   디코딩하므로 380장 × 약 2타일 = 760회, 20 MP 이미지다.
+    #   OpenCV 의 imread 는 GIL 을 놓으므로 스레드로 **미리 읽어두면**
+    #   합성(warp/compositing)과 겹쳐 실행된다.
+    #   전역 라벨맵이 승자를 이미 정해 두었으므로 프레임 처리 순서가
+    #   결과에 영향을 주지 않는다 — 선읽기가 안전하다.
+    _pool = None
+    _futures: dict = {}
+    if cfg.prefetch_workers > 0:
+        from concurrent.futures import ThreadPoolExecutor
+        _pool = ThreadPoolExecutor(max_workers=cfg.prefetch_workers)
+
+    def prefetch(indices):
+        if _pool is None:
+            return
+        for i in indices:
+            if i not in img_cache and i not in _futures:
+                _futures[i] = _pool.submit(_decode, i)
+
     def load(idx):
         if idx not in img_cache:
-            im = cv2.imread(str(image_paths[idx]), cv2.IMREAD_UNCHANGED)
-            if im is not None:
-                if im.ndim == 3 and im.shape[2] >= 3:
-                    im = cv2.cvtColor(im[:, :, :3], cv2.COLOR_BGR2RGB)
-                elif im.ndim == 2 and bands == 3:
-                    im = cv2.cvtColor(im, cv2.COLOR_GRAY2RGB)
+            fut = _futures.pop(idx, None)
+            im = fut.result() if fut is not None else _decode(idx)
             img_cache[idx] = im
-            if len(img_cache) > cfg.image_cache:
+            while len(img_cache) > cfg.image_cache:
                 img_cache.pop(next(iter(img_cache)))
         return img_cache[idx]
 
@@ -719,13 +971,17 @@ def mosaic_frames(frames: list[FrameHomography],
                     flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
                     borderMode=cv2.BORDER_REPLICATE)
 
-            for idx in order:
-                w_ = wins.get(idx)
-                if w_ is None:
-                    continue
+            tile_idx = [i for i in order
+                        if wins.get(i) is not None
+                        and not (wins[i][1] + wins[i][3] <= v0t
+                                 or wins[i][1] >= v0t + th)]
+            prefetch(tile_idx[:cfg.image_cache])
+
+            for pos, idx in enumerate(tile_idx):
+                # 앞으로 쓸 프레임을 미리 읽어 둔다 (디코딩과 합성을 겹침).
+                prefetch(tile_idx[pos + 1: pos + 1 + cfg.prefetch_ahead])
+                w_ = wins[idx]
                 fu0, fv0, fw, fh_ = w_
-                if fv0 + fh_ <= v0t or fv0 >= v0t + th:
-                    continue                      # 이 타일과 안 겹침
                 img = load(idx)
                 if img is None:
                     continue
@@ -778,6 +1034,11 @@ def mosaic_frames(frames: list[FrameHomography],
             if (t + 1) % 5 == 0 or t == n_tiles - 1:
                 logger.info("  타일 %d/%d 완료", t + 1, n_tiles)
 
+    if _pool is not None:
+        for f_ in _futures.values():
+            f_.cancel()
+        _pool.shutdown(wait=False)
+
     fill_ratio = filled_total / float(out_w * out_h)
     logger.info("모자이크 저장: %s (%d장 합성, 충전율 %.1f%%)",
                 output_path, len(n_ok), fill_ratio * 100)
@@ -795,6 +1056,8 @@ def mosaic_frames(frames: list[FrameHomography],
         "max_offnadir_ratio": cfg.max_offnadir_ratio,
         "dsm": cfg.dsm.stats() if cfg.dsm is not None else None,
         "offnadir_fallback_ratio": n_fallback,
+        "offnadir_tolerance": cfg.offnadir_tolerance,
+        "offnadir_epsilon": cfg.offnadir_epsilon,
         "bounds": {"x_min": x_min, "y_min": y_min, "x_max": x_max, "y_max": y_max},
         "frames_ok": len(n_ok), "frames_failed": len(frames) - len(n_ok),
         "outlier_frames": outliers,

@@ -106,6 +106,7 @@ def rtk_fixed_bundle_adjustment(initial_cameras: np.ndarray,
                                 attitude_sigma_weak_deg: float | None = None,
                                 weak_obs_ratio: float = 0.30,
                                 max_nfev: int = 200,
+                                coarse_ftol: float = 0.0,
                                 verbose: int = 0):
     """카메라 위치를 RTK 에 고정하고 자세 + 점만 최적화.
 
@@ -149,7 +150,7 @@ def rtk_fixed_bundle_adjustment(initial_cameras: np.ndarray,
     if attitude_sigma_weak_deg is None:
         attitude_sigma_weak_deg = attitude_sigma_deg
     weak = obs_cnt < weak_obs_ratio * med_obs
-    if weak.any():
+    if weak.any() and abs(attitude_sigma_weak_deg - attitude_sigma_deg) > 1e-9:
         sig_vec[weak] = np.radians(max(attitude_sigma_weak_deg, 1e-3))
         logger.info("  자세 prior 차등: 관측 부족 %d장에 σ=%.2f° "
                     "(나머지 %.2f°) — 가장자리 프레임이 소수 오매칭에 "
@@ -204,17 +205,31 @@ def rtk_fixed_bundle_adjustment(initial_cameras: np.ndarray,
     # ★ prior 잔차가 robust loss 의 선형 구간에 묻히지 않도록, f_scale 에
     #   비례해 키운다. 이렇게 하면 "자세를 σ 만큼 어기는 비용" 이 "관측 하나를
     #   f_scale 만큼 어기는 비용" 과 같은 척도가 된다.
+    # ★ 느슨한 단계는 '수렴' 이 목적이 아니라 '다음 게이트가 쓸 만한 수준까지
+    #   내리는 것' 이 목적이다. 실측에서 느슨한 BA 3회가 모두 nfev=200 상한에
+    #   걸려 20m47s 를 썼는데(전체 41분의 절반), 재실행#2 는 시작 9.8 px →
+    #   끝 9.43 px 로 6분을 거의 낭비했다.
+    #
+    #   scipy 의 ftol/xtol 로 '개선이 멈추면 조기 종료' 시킨다. 정밀 단계는
+    #   기본값(엄격)을 그대로 쓰므로 최종 품질에는 영향이 없다.
+    #
+    #   ★ 1차 시도에서 ftol=1e-3 은 **너무 느슨**했다. 1단계가 nfev 7~12 로
+    #     즉시 멈춰 두 단계가 자세를 0.001° 밖에 못 움직였다 (= 아무 일도
+    #     안 함). 게다가 2단계(huber)에는 tol 을 안 걸어 nfev=200 까지 가서
+    #     한 단계가 3m41s 를 썼다. 기본값을 1e-4 로 조이고 **두 단계 모두**
+    #     에 적용한다.
+    tol = dict(ftol=coarse_ftol, xtol=coarse_ftol) if coarse_ftol else {}
     t0 = time.perf_counter()
     prior_gain[0] = stage1
     res = least_squares(residuals, x0, loss="soft_l1", f_scale=stage1,
-                        max_nfev=max_nfev, **common)
+                        max_nfev=max_nfev, **tol, **common)
     logger.info("- BA 1단계 (soft_l1, f_scale=%.1f px): %s (nfev=%d)",
                 stage1, fmt_elapsed(time.perf_counter() - t0), res.nfev)
 
     t0 = time.perf_counter()
     prior_gain[0] = 2.0
     res = least_squares(residuals, res.x, loss="huber", f_scale=2.0,
-                        max_nfev=max_nfev, **common)
+                        max_nfev=max_nfev, **tol, **common)
     logger.info("- BA 2단계 (huber, f_scale=2.0 px): %s (nfev=%d, status=%d)",
                 fmt_elapsed(time.perf_counter() - t0), res.nfev, res.status)
 

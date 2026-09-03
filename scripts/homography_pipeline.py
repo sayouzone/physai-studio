@@ -151,6 +151,35 @@ def parse_args() -> argparse.Namespace:
                    help="연직 제한 예외를 쓰지 않는다. 가장자리에 구멍이 생기는 "
                         "대신 남는 영역의 품질이 균일해진다. 실측: 예외 영역"
                         "(11.3%%)의 어긋남이 0.475 m 로 안쪽 0.039 m 의 12배")
+    p.add_argument("--offnadir-tolerance", dest="offnadir_tolerance",
+                   type=float, default=1.15,
+                   help="k≤--offnadir-frac 로 못 덮는 픽셀에서, 도달 가능한 "
+                        "최소 k 의 몇 배까지 허용할지. 공통 영역 기준 실측: "
+                        "1.0 → 0.0596m, 1.15 → 0.0548m, 1.3 → 0.0567m 로 "
+                        "1.15 가 최고이고 충전율도 가장 높다")
+    p.add_argument("--offnadir-epsilon", dest="offnadir_epsilon", type=float,
+                   default=0.002,
+                   help="픽셀별 k 상한에 더하는 여유. 최소 k 를 만드는 프레임이 "
+                        "부동소수점 등호 비교에서 탈락하는 것을 막는다 — 이게 "
+                        "없으면 tolerance 1.0 에서 충전율을 15%%p 잃는다")
+    p.add_argument("--plane-lrf-tolerance", dest="plane_lrf_tolerance_m",
+                   type=float, default=3.0,
+                   help="기준면 자동보정 결과가 LRF/메타데이터 기준에서 얼마나 "
+                        "벗어나도 되는지 (m). **--plane-shift-limit 과 함께** "
+                        "올려야 겹침 기반 보정이 실제로 적용된다 — 한쪽만 "
+                        "올리면 사후 검증에서 되돌려진다")
+    p.add_argument("--plane-shift-limit", dest="plane_shift_limit_m",
+                   type=float, default=3.0,
+                   help="겹침에서 측정한 기준면 높이 보정의 절대 상한 (m). "
+                        "이 값을 넘으면 기각한다. 로그에 '산포가 작아 추정 "
+                        "자체는 일관됩니다' 가 뜨면 그 크기 이상으로 올려 "
+                        "시험해 볼 가치가 있다 (극동대: Δz -4.5~-6.2 m)")
+    p.add_argument("--seam-panel-penalty", dest="seam_panel_penalty",
+                   type=float, default=2.0,
+                   help="시임이 패널 위를 지날 때의 벌점. 패널 상면은 기준면보다 "
+                        "약 1 m 높아 시임이 그 위를 지나면 Δh·k 만큼의 단차가 "
+                        "그대로 보인다 (실측 99%% 단차 41cm, 최대 99cm). "
+                        "0 이면 기존 동작(차이 영상만 사용)")
     p.add_argument("--offnadir-frac", dest="offnadir_frac", type=float,
                    default=0.65,
                    help="연직 제한 자동 조정 비율 (프레임 최대 k 대비). "
@@ -196,6 +225,25 @@ def parse_args() -> argparse.Namespace:
                    default=6.0,
                    help="DSM 기복 상한 (m). 초과하면 점군 품질 이상으로 보고 "
                         "단일 평면으로 대체")
+    p.add_argument("--no-two-layer", dest="use_two_layer",
+                   action="store_false",
+                   help="2층 높이맵(패널 상면/지면)을 쓰지 않는다. 기본은 사용 — "
+                        "남은 어긋남의 거의 전부가 평면 하나로 두 층을 덮은 "
+                        "Δh×k 항이다 (실측: 안쪽 0.039 / 중간 0.107 / 바깥 "
+                        "0.398 m 가 모두 Δh=1.23 m 로 설명됨)")
+    p.add_argument("--two-layer-min-area", dest="two_layer_min_area_m2",
+                   type=float, default=3.0,
+                   help="패널 분할에서 유지할 최소 연결성분 면적 (㎡)")
+    p.add_argument("--layer-surface", dest="layer_surface",
+                   action="store_true",
+                   help="2층 표면 모델 사용 (지면/패널 상면). 연속 DSM 과 달리 "
+                        "셀당 3~5점이면 되므로 이 점 밀도에서도 성립한다. "
+                        "지면층 기복변위(k=0.304 에서 29cm)를 제거한다")
+    p.add_argument("--layer-gap", dest="layer_gap_m", type=float, default=0.0,
+                   help="지면과 패널 상면의 높이차 (m). 0 이면 상면 검출값 사용")
+    p.add_argument("--layer-cell", dest="layer_cell_m", type=float, default=0.5,
+                   help="2층 모델 격자 (m). 패널 행 폭 1.3 m 를 2~3칸으로 "
+                        "나눌 수 있어야 한다")
     p.add_argument("--no-dsm", dest="use_dsm", action="store_false",
                    help="DSM 사용 안 함(단일 평면). 기본은 BA 점군이 5000개 "
                         "이상이면 DSM 사용 — 지면과 패널 상면이 2.4 m 떨어진 "
@@ -282,6 +330,7 @@ def main() -> None:
         ba_stage1_attitude_deg=args.ba_stage1_attitude_deg,
         seam_optimize=args.seam_optimize,
         seam_cost_weight=args.seam_cost_weight,
+        seam_panel_penalty=args.seam_panel_penalty,
         exposure_compensate=args.exposure_compensate,
         glint_penalty=args.glint_penalty,
         tile_memory_mb=args.tile_memory_mb,
@@ -289,6 +338,7 @@ def main() -> None:
         max_offnadir_ratio=args.max_offnadir_ratio,
         rtk_boost_max=args.rtk_boost_max,
         plane_lrf_tolerance_m=args.plane_lrf_tolerance_m,
+        plane_shift_limit_m=args.plane_shift_limit_m,
         auto_focal=args.auto_focal,
         fix_positions=args.fix_positions,
         attitude_sigma_deg=args.attitude_sigma_deg,
@@ -303,8 +353,15 @@ def main() -> None:
         offnadir_auto=args.offnadir_auto,
         offnadir_frac=args.offnadir_frac,
         offnadir_fallback=args.offnadir_fallback,
+        offnadir_tolerance=args.offnadir_tolerance,
+        offnadir_epsilon=args.offnadir_epsilon,
         dsm_max_relief_m=args.dsm_max_relief_m,
         use_dsm=args.use_dsm,
+        layer_surface=args.layer_surface,
+        layer_gap_m=args.layer_gap_m,
+        layer_cell_m=args.layer_cell_m,
+        use_two_layer=args.use_two_layer,
+        two_layer_min_area_m2=args.two_layer_min_area_m2,
         dsm_cell_m=args.dsm_cell_m,
         glob_pattern=args.glob_pattern,
     )
@@ -316,9 +373,31 @@ def main() -> None:
         print(f"pipeline.py: {getattr(_pm, '__file__', '?')}")
         _need = ["coarse_ba_ftol", "fine_gate_auto", "auto_distortion",
                  "estimate_distortion", "mid_reproj_factor", "fix_positions",
-                 "plane_tilt_tolerance_deg", "offnadir_frac", "auto_focal"]
+                 "plane_tilt_tolerance_deg", "offnadir_frac", "auto_focal",
+                 "use_feature_cache", "prefetch_workers", "layer_surface",
+                 "use_two_layer"]
         for _k in _need:
-            print(f"  {_k:26} {'있음' if _k in _accepted else '없음 ← 갱신 필요'}")
+            print(f"  pipeline.py  {_k:24} "
+                  f"{'있음' if _k in _accepted else '없음 ← 갱신 필요'}")
+        # ortho.py 도 함께 본다 — pipeline→MosaicConfig 경계에서도
+        # 같은 불일치로 죽은 적이 있다.
+        try:
+            import inspect as _ins
+            from solar_thermal.georeferencing.homography.ortho import (
+                MosaicConfig as _MC)
+            print(f"ortho.py: {getattr(_MC, '__module__', '?')}")
+            _mc = set(_ins.signature(_MC.__init__).parameters)
+            _tolerant = any(p.kind == p.VAR_KEYWORD
+                            for p in _ins.signature(_MC.__init__)
+                            .parameters.values())
+            for _k in ["two_layer_builder", "dsm", "prefetch_workers",
+                       "offnadir_frac", "tile_memory_mb"]:
+                print(f"  ortho.py     {_k:24} "
+                      f"{'있음' if _k in _mc else '없음 ← 갱신 필요'}")
+            print(f"  ortho.py     {'미지원 인자 허용':24} "
+                  f"{'예' if _tolerant else '아니오 ← 갱신 권장'}")
+        except Exception as _e:
+            print(f"  ortho.py 확인 실패: {_e}")
         raise SystemExit(0)
     _dropped = sorted(k for k in _kwargs if k not in _accepted)
     if _dropped:

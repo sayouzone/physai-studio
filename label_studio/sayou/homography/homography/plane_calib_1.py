@@ -107,6 +107,7 @@ def estimate_plane_height_from_overlaps(
     min_response: float = 0.05,
     min_baseline_ratio: float = 0.03,
     robust: bool = True,
+    max_shift_m: float = 3.0,
     seed: int = 0,
 ) -> PlaneCalibration | None:
     """겹침 시차로 ``plane`` 에 더해야 할 높이 보정량을 추정.
@@ -121,6 +122,9 @@ def estimate_plane_height_from_overlaps(
     min_response : 위상상관 응답 하한. 텍스처 없는 쌍 제거.
     min_baseline_ratio : ``|u_i − u_j|`` 하한. 너무 작으면 시차가 안 생긴다.
     robust : 쌍별 추정치의 중앙값 사용 (이상치에 강함).
+    max_shift_m : 1회 보정량의 절대 상한 (m). 기준면은 지면과 구조물 상단
+        사이에서만 움직일 수 있다. 크게 잡으면 겹침의 시차 외 불일치를
+        평면 높이로 흡수해 버린다 (실측 −8.2 m 사례).
 
     Returns
     -------
@@ -215,6 +219,35 @@ def estimate_plane_height_from_overlaps(
     dz = float(np.median(arr)) if robust else float(arr.mean())
     resid = float(np.median(np.abs(arr - dz)))
 
+    # ---- 물리적 타당성 가드 -------------------------------------------
+    # ★ 실측 데이터에서 이 추정기가 평면을 8.4 m 아래(지하) 로 밀어버린
+    #   사례가 있었다. 겹침에 시차 외의 불일치(자세 오차, 정반사로 인한
+    #   밝기 급변)가 섞이면 위상상관이 엉뚱한 봉우리를 잡고, 그 값이
+    #   그대로 평면 높이로 흡수된다.
+    #
+    #   기준면은 물리적으로 '지면 근처 ~ 구조물 상단' 범위를 벗어날 수
+    #   없다. 카메라-평면 거리의 20% 를 넘는 보정은 추정 실패로 본다.
+    cam_h = float(np.median([f.camera_xyz[2] for f in frames])) - float(
+        plane.height_at(*np.mean([f.camera_xyz[:2] for f in frames], axis=0)))
+    # ★ 이전 상한 max(0.2·cam_h, 3.0) 은 44.9 m 고도에서 8.9 m 를 허용했다.
+    #   실데이터에서 보정이 −8.2 m 로 그 안에 들어와 통과했고, 기준면이 지면
+    #   보다 6.35 m 아래로 내려갔다. 그 상태에서는 패널이 기준면보다 8.75 m
+    #   위에 있어 기복변위가 시임에서 1.75 m 에 달한다 — BA 를 고쳐 얻은
+    #   이득을 그대로 까먹는다. 기준면 높이는 지면과 구조물 상단 사이
+    #   몇 m 안에서만 움직일 수 있으므로 상한을 절대값으로 묶는다.
+    limit = max_shift_m
+    if abs(dz) > limit:
+        logger.warning(
+            "평면 높이 자동보정 기각: Δz=%+.2f m 가 타당 범위 ±%.1f m 를 "
+            "벗어났습니다 (카메라-평면 %.1f m). 겹침에 시차 외 불일치가 "
+            "많다는 뜻이므로 보정을 적용하지 않습니다.", dz, limit, cam_h)
+        return None
+    if resid > 0.5 * max(abs(dz), 0.3):
+        logger.warning(
+            "평면 높이 자동보정 기각: 쌍별 산포 ±%.2f m 가 추정값 %+.2f m "
+            "대비 너무 큽니다 — 신뢰할 수 없는 추정입니다.", resid, dz)
+        return None
+
     logger.info("평면 높이 자동보정: Δz = %+.3f m (쌍 %d/%d, 산포 ±%.3f m)",
                 dz, n_used, len(cand), resid)
     if resid > 0.5:
@@ -238,6 +271,7 @@ def calibrate_plane(frames_builder,
                     *,
                     max_iter: int = 3,
                     tol_m: float = 0.05,
+                    total_limit_m: float = 3.0,
                     **kwargs) -> tuple[GroundPlane, PlaneCalibration | None]:
     """반복 보정 — 평면을 옮기면 ``u_i`` 도 조금 바뀌므로 2~3 회면 수렴한다.
 
@@ -256,13 +290,21 @@ def calibrate_plane(frames_builder,
     """
     cur = plane
     last: PlaneCalibration | None = None
+    c0 = plane.c
     for it in range(max_iter):
         frames = frames_builder(cur)
         cal = estimate_plane_height_from_overlaps(frames, image_paths, cur, **kwargs)
         if cal is None:
             break
         last = cal
-        cur = apply_calibration(cur, cal)
+        nxt = apply_calibration(cur, cal)
+        # 누적 이동도 묶는다 — 반복이 조금씩 같은 방향으로 밀 수 있다.
+        if abs(nxt.c - c0) > total_limit_m:
+            logger.warning("평면 보정 누적 %+.2f m 가 상한 ±%.1f m 를 넘어 "
+                           "중단합니다 (현재 %.2f m 유지).",
+                           nxt.c - c0, total_limit_m, cur.c)
+            break
+        cur = nxt
         if abs(cal.delta_z_m) < tol_m:
             logger.info("평면 보정 수렴 (%d회): 최종 기준면 표고 %.2f m", it + 1, cur.c)
             break

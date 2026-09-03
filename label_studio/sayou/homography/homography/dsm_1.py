@@ -89,10 +89,17 @@ def build_dsm(points_xyz: np.ndarray,
               bounds: tuple,
               *,
               cell_m: float = 0.8,
-              min_pts_per_cell: int = 2,
+              min_pts_per_cell: int = 8,
+              auto_cell: bool = True,
+              target_pts_per_cell: float = 12.0,
               robust_sigma: float = 3.0,
+              trim_band_m: float = 4.0,
               smooth_cells: float = 0.8,
-              surface: str = "upper") -> DSM | None:
+              surface: str = "upper",
+              plane=None,
+              band_m: float = 4.0,
+              max_relief_m: float = 8.0,
+              min_coverage: float = 0.40) -> DSM | None:
     """BA 점군 → 성긴 DSM.
 
     Parameters
@@ -103,8 +110,51 @@ def build_dsm(points_xyz: np.ndarray,
         않는다). ``"median"`` 은 중앙값.
     robust_sigma : 셀 안에서 중앙값으로부터 이 배수의 MAD 를 넘는 점은 버린다.
         BA 이상치가 셀 높이를 끌고 가지 않게 한다.
+    auto_cell : ``True`` 면 점 밀도에서 셀 크기를 자동 결정한다.
+
+        ★ 실측 실패의 진짜 원인이 여기 있었다. 0.4 m 셀로 돌렸는데 점 밀도가
+          7.9 점/m² 라 **셀당 1.3점**이었다. 중앙값·MAD 이상치 제거가 성립할
+          수 없고, 채워진 셀은 이상치 한두 개가 그대로 높이가 된다. 충전율
+          25.8%, 기복 35.3 m 가 그 결과다.
+
+          셀당 ``target_pts_per_cell`` 점이 들어가도록 셀을 잡으면 통계가
+          성립한다 (이 현장은 약 1.2 m).
+    target_pts_per_cell : 자동 결정의 목표 셀당 점 수.
+    trim_band_m : **격자에 넣기 전에** 전역 로버스트 평면에서 이 거리를 넘는
+        점을 버린다.
+
+        ★ 반복 텍스처의 오매칭은 재투영이 완벽한데 깊이만 틀린 점을 만든다.
+          패널 셀 주기 0.23 m, 베이스라인 1.6 m (시선각 2°) 이면 한 칸
+          어긋난 매칭이 **6.5 m 깊이오차**를 만들고, 재투영 게이트 3 px 로는
+          절대 걸러지지 않는다. 실측 점군의 기복이 35.3 m 로 나온 이유다
+          (지면~패널 상면은 2.4 m).
+
+          셀 단위 MAD 만으로는 부족하다 — 한 셀 안의 점이 통째로 이상치일
+          수 있기 때문이다. 전역 평면 기준으로 먼저 잘라내야 한다.
     smooth_cells : 마지막 가우시안 다듬기 σ (셀 단위). 과하게 주면 층 경계가
         뭉개져 DSM 의 이점이 사라진다.
+    plane : 기준 평면 (``GroundPlane``). 주면 이 평면에서 ``band_m`` 밖의
+        점을 **DSM 을 만들기 전에** 버린다.
+    band_m : 평면 기준 수용 밴드 (m). 태양광 단지의 실제 기복은 지면~패널
+        상면 2~3 m 이므로 ±4 m 면 넉넉하다.
+    max_relief_m : 완성된 DSM 의 기복(1~99 백분위 차) 상한. 넘으면 **DSM 을
+        폐기**하고 ``None`` 을 돌려준다.
+    min_coverage : 점이 들어간 셀 비율 하한. 미만이면 폐기.
+
+    ★ 왜 이런 게이트가 필요한가 (실측)
+    ---------------------------------
+    231,713 점짜리 BA 점군으로 0.4 m DSM 을 만들었더니:
+
+        기복 24.28 m (기대 2~3 m), 충전율 18.9% (기대 ≥40%),
+        표고 중앙값 105.6 m (기대 ≈113.4 m — 지면보다 7.8 m 아래)
+
+    점이 많아졌다고 깨끗한 것은 아니었습니다. 오삼각측량 점이 대량 섞여
+    z 산포가 24 m 였고, DSM 은 그것을 그대로 지형으로 믿어 픽셀마다 엉뚱한
+    높이로 역투영했습니다. 결과는 단일 평면보다 나빴습니다
+    (파손 블록 18.9% → 23.7%).
+
+    **나쁜 점군으로 만든 DSM 은 평면보다 못합니다.** 그래서 통과 기준을
+    두고, 못 넘으면 조용히 평면으로 되돌아갑니다.
     """
     pts = np.asarray(points_xyz, dtype=np.float64)
     pts = pts[np.all(np.isfinite(pts), axis=1)]
@@ -112,7 +162,70 @@ def build_dsm(points_xyz: np.ndarray,
         logger.warning("DSM 생성 불가: 유효 점 %d개", len(pts))
         return None
 
+    # ---- 점군 정제: 평면 기준 밴드 밖은 오삼각측량으로 본다 --------------
+    n_raw = len(pts)
+    if plane is not None:
+        z_ref = plane.height_at(pts[:, 0], pts[:, 1]) \
+            if hasattr(plane, "height_at") else plane.c
+        resid = pts[:, 2] - np.asarray(z_ref, dtype=np.float64)
+    else:
+        resid = pts[:, 2] - np.median(pts[:, 2])
+    keep = np.abs(resid) <= band_m
+    pts = pts[keep]
+    logger.info("DSM 점군 정제: %d → %d개 (밴드 ±%.1f m, 제거 %.1f%%)",
+                n_raw, len(pts), band_m, 100.0 * (1 - len(pts) / max(n_raw, 1)))
+    if len(pts) < 100:
+        logger.warning("DSM 생성 불가: 정제 후 점 %d개 — 점군 z 분포가 "
+                       "기준면과 크게 어긋납니다 (BA 품질 확인 필요).", len(pts))
+        return None
+
+    # ---- 전역 로버스트 평면으로 조대 이상치 제거 ----------------------
+    n_before = len(pts)
+    ctr = pts.mean(axis=0)
+    P = pts - ctr
+    A = np.column_stack([P[:, 0], P[:, 1], np.ones(len(P))])
+    coef = np.array([0.0, 0.0, 0.0])
+    for _ in range(3):
+        resid = P[:, 2] - A @ coef
+        med = np.median(resid)
+        mad = np.median(np.abs(resid - med)) * 1.4826 + 1e-6
+        keep = np.abs(resid - med) <= 3.0 * mad
+        if keep.sum() < 100:
+            break
+        coef, *_ = np.linalg.lstsq(A[keep], P[keep, 2], rcond=None)
+    resid = P[:, 2] - A @ coef
+    band = np.abs(resid - np.median(resid)) <= trim_band_m
+    if band.sum() >= 100:
+        pts = pts[band]
+    logger.info("DSM 전처리: 전역 평면 ±%.1f m 밖의 점 %d개 제거 "
+                "(%d → %d, %.1f%%)", trim_band_m, n_before - len(pts),
+                n_before, len(pts), 100.0 * len(pts) / max(n_before, 1))
+    if n_before - len(pts) > 0.4 * n_before:
+        logger.warning("  점군의 %.0f%% 가 이상치입니다 — 삼각측량 시선각 "
+                       "하한(--min-tri-angle)을 올리는 것을 권합니다. "
+                       "반복 텍스처에서 짧은 베이스라인은 깊이가 발산합니다.",
+                       100.0 * (n_before - len(pts)) / max(n_before, 1))
+
     x_min, y_min, x_max, y_max = bounds
+
+    if auto_cell:
+        area = max((x_max - x_min) * (y_max - y_min), 1.0)
+        density = len(pts) / area
+        need = float(np.sqrt(target_pts_per_cell / max(density, 1e-9)))
+        if need > cell_m * 1.15:
+            logger.info("DSM 셀 자동 조정: %.2f → %.2f m "
+                        "(점 밀도 %.1f 점/m², 목표 셀당 %.0f점). "
+                        "요청한 셀은 셀당 %.1f점뿐이라 이상치 제거가 "
+                        "성립하지 않습니다.",
+                        cell_m, need, density, target_pts_per_cell,
+                        density * cell_m ** 2)
+            cell_m = need
+        if cell_m > 1.5:
+            logger.warning("DSM 셀이 %.2f m 입니다 — 패널 행 폭(약 1.3 m)보다 "
+                           "커서 지면/패널 두 층을 분리하지 못합니다. "
+                           "지형 경사만 반영되고 층 분리 효과는 없습니다. "
+                           "층을 분리하려면 점군 밀도를 높여야 합니다.", cell_m)
+
     nx = int(np.ceil((x_max - x_min) / cell_m))
     ny = int(np.ceil((y_max - y_min) / cell_m))
     if nx < 4 or ny < 4 or nx * ny > 40_000_000:
@@ -151,9 +264,10 @@ def build_dsm(points_xyz: np.ndarray,
     filled = np.isfinite(height)
     coverage = float(filled.mean())
 
-    if coverage < 0.15:
-        logger.warning("DSM 셀 충전율 %.1f%% — 점군이 너무 희박합니다. "
-                       "cell_m 을 키우거나 단일 평면을 쓰세요.", coverage * 100)
+    if coverage < min_coverage:
+        logger.warning("DSM 폐기: 셀 충전율 %.1f%% < %.0f%% — 점군이 희박합니다. "
+                       "--dsm-cell 을 키우거나(예: %.1f m) 단일 평면을 쓰세요.",
+                       coverage * 100, min_coverage * 100, cell_m * 2)
         return None
 
     # 구멍 메우기: inpaint 는 큰 격자에서 느리므로 점진적 팽창 평균.
@@ -181,6 +295,13 @@ def build_dsm(points_xyz: np.ndarray,
 
     dsm = DSM(h.astype(np.float32), x_min, y_max, cell_m, len(z), coverage)
     st = dsm.stats()
+    if st["relief_p99_m"] > max_relief_m:
+        logger.warning(
+            "DSM 폐기: 기복 %.2f m 가 상한 %.1f m 를 넘습니다 (표고 %.1f~%.1f m). "
+            "태양광 단지의 실제 기복은 지면~패널 상면 2~3 m 입니다 — 점군에 "
+            "오삼각측량 점이 섞였다는 뜻이므로 단일 평면을 사용합니다.",
+            st["relief_p99_m"], max_relief_m, st["z_min"], st["z_max"])
+        return None
     logger.info("DSM 생성: %d×%d 셀 (%.2f m), 점 %d개, 충전율 %.1f%%, "
                 "표고 %.2f~%.2f m (기복 %.2f m)",
                 ny, nx, cell_m, len(z), coverage * 100,
