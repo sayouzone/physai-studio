@@ -141,9 +141,6 @@ class MosaicConfig:
                  seam_optimize: bool = True,
                  seam_cost_weight: float = 1.0,
                  seam_panel_penalty: float = 0.0,
-                 panel_unit_m: float = 0.0,
-                 panel_unit_k_mult: float = 3.0,
-                 panel_unit_glint_weight: float = 0.0,
                  seam_cost_blur_m: float = 1.5,
                  exposure_compensate: bool = True,
                  glint_penalty: float = 0.7,
@@ -176,9 +173,6 @@ class MosaicConfig:
         self.seam_optimize = bool(seam_optimize)
         self.seam_cost_weight = float(max(seam_cost_weight, 0.0))
         self.seam_panel_penalty = float(max(seam_panel_penalty, 0.0))
-        self.panel_unit_m = float(max(panel_unit_m, 0.0))
-        self.panel_unit_k_mult = float(max(panel_unit_k_mult, 1.0))
-        self.panel_unit_glint_weight = float(max(panel_unit_glint_weight, 0.0))
         self.seam_cost_blur_m = float(max(seam_cost_blur_m, 0.0))
         self.exposure_compensate = bool(exposure_compensate)
         self.glint_penalty = float(np.clip(glint_penalty, 0.0, 1.0))
@@ -657,11 +651,6 @@ def _coarse_reference(frames, image_paths, order, bounds, cfg,
     score = np.zeros((oh, ow), dtype=np.float32)
     blur_c = max(int(cfg.seam_cost_blur_m / g), 1)
     gains: dict[int, float] = {}
-    # ★ 패널 단위 반사 판정을 하려면 후보 프레임을 단위에 다시 워프해야 하고,
-    #   그러려면 저해상도 영상이 필요하다. 켜져 있을 때만 보관한다
-    #   (380장 × 0.25배율 grayscale ≈ 480 MB).
-    smalls: dict[int, np.ndarray] = {}
-    _keep_small = (cfg.panel_unit_m > 0 and cfg.panel_unit_glint_weight > 0)
 
     for idx in order:
         img = cv2.imread(str(image_paths[idx]), cv2.IMREAD_GRAYSCALE)
@@ -669,8 +658,6 @@ def _coarse_reference(frames, image_paths, order, bounds, cfg,
             continue
         small = cv2.resize(img, None, fx=0.25, fy=0.25,
                            interpolation=cv2.INTER_AREA)
-        if _keep_small:
-            smalls[idx] = small
         fh = frames[idx]
         H = fh.ortho_pixel_matrix(x_min, y_max, g)
         S = np.diag([0.25, 0.25, 1.0]).astype(np.float64)
@@ -777,7 +764,7 @@ def _coarse_reference(frames, image_paths, order, bounds, cfg,
     logger.info("전역 라벨맵: %d×%d px (GSD %.3f m), 배정된 프레임 %d개 — "
                 "타일 독립 시임 판정", ow, oh, g,
                 int(len(np.unique(label[label >= 0]))))
-    return gains, label, g, canvas, filled, smalls
+    return gains, label, g, canvas, filled
 
 
 def mosaic_frames(frames: list[FrameHomography],
@@ -854,56 +841,38 @@ def mosaic_frames(frames: list[FrameHomography],
                 x_max - x_min, y_max - y_min, n_tiles, tile_h,
                 tile_h * bytes_per_row / 1e6)
 
-    gains, label_map, ref_gsd, coarse_img, coarse_ok, coarse_smalls = \
-        _coarse_reference(frames, image_paths, order, bounds, cfg,
-                          restrict=True)
+    gains, label_map, ref_gsd, coarse_img, coarse_ok = _coarse_reference(
+        frames, image_paths, order, bounds, cfg, restrict=True)
 
-    # ★ 패널 마스크가 필요한 두 기능을 하나의 2패스로 묶는다.
-    #   (a) 시임 벌점 (--seam-panel-penalty, 기본 0 = 끔)
-    #   (b) 패널 단위 프레임 배정 (--panel-unit, 기본 0 = 끔)
+    # ★ 2패스 — 1패스 기준 영상에서 패널을 분할한 뒤 그 마스크로 시임을
+    #   다시 배치한다. 시임이 패널 위를 지나면 Δh·k 만큼의 단차가 그대로
+    #   보인다. 실측(그린환경센터 RGB, 잘라낸 구간)에서 패널 상단 경계의
+    #   열 간 점프를 재니 중앙값 0 px 인데 **99% 가 64 px(41 cm), 최대
+    #   155 px(99 cm)** 이고 4.9% 의 열에서 3 px 초과 점프가 났다.
+    #   QC 중앙값(0.06 m)은 이 국소 단차를 못 잡고 p90(0.93 m)이 잡는다.
     #
-    #   시임이 패널을 가로지르면 Δh·k 만큼의 계단 단차가 그대로 보인다.
-    #   실측(그린환경센터 RGB): 패널 상단 경계의 열 간 점프 99% 가 41 cm,
-    #   최대 99 cm, 3 px 초과가 열의 4.9%.
-    #
-    #   (a) 벌점은 "되도록 피하라" 일 뿐 **금지가 아니어서** 전체 기준으로
-    #       효과가 없었다 (후속 33~35).
-    #   (b) 배정 단위를 패널 모듈로 올리면 한 모듈이 통째로 한 프레임에서
-    #       오므로 **모듈이 찢어질 수 없다.** 이쪽이 근본적이다.
-    _panel_unit_info = None
-    if ((cfg.seam_panel_penalty > 0 or cfg.panel_unit_m > 0)
+    #   1패스 결과를 통째로 버리고 다시 만들므로 노출 이득·시임은 여전히
+    #   **한 번만** 결정된다 (앞서 단계적 예외에서 겪은 이득 불일치 없음).
+    if (cfg.seam_panel_penalty > 0 and cfg.seam_optimize
             and coarse_img is not None and coarse_ok is not None):
         try:
             from .two_layer import segment_panels
             pm = segment_panels(coarse_img, coarse_ok, ref_gsd)
             frac = float(pm[coarse_ok].mean()) if coarse_ok.any() else 0.0
-            if not (0.05 < frac < 0.90):
-                logger.info("패널 분할 결과가 타당 범위를 벗어나 "
-                            "(면적비 %.1f%%) 패널 기반 처리를 생략합니다",
-                            frac * 100)
+            if 0.05 < frac < 0.90:
+                pm_f = cv2.GaussianBlur(pm.astype(np.float32), (0, 0),
+                                        max(0.5 / ref_gsd, 1.0))
+                logger.info("시임 재배치: 패널 %.1f%% 영역에 벌점 %.1f 적용 "
+                            "— 시임이 패널을 피해 잔디·그림자로 흐르게 합니다",
+                            frac * 100, cfg.seam_panel_penalty)
+                gains, label_map, ref_gsd, coarse_img, coarse_ok = \
+                    _coarse_reference(frames, image_paths, order, bounds, cfg,
+                                      panel_mask=pm_f, restrict=True)
             else:
-                if cfg.seam_panel_penalty > 0 and cfg.seam_optimize:
-                    pm_f = cv2.GaussianBlur(pm.astype(np.float32), (0, 0),
-                                            max(0.5 / ref_gsd, 1.0))
-                    logger.info("시임 재배치: 패널 %.1f%% 영역에 벌점 %.1f "
-                                "적용", frac * 100, cfg.seam_panel_penalty)
-                    (gains, label_map, ref_gsd, coarse_img, coarse_ok,
-                     coarse_smalls) = _coarse_reference(
-                        frames, image_paths, order, bounds, cfg,
-                        panel_mask=pm_f, restrict=True)
-                if cfg.panel_unit_m > 0:
-                    from .panel_units import consolidate_labels_by_unit
-                    label_map, _pu = consolidate_labels_by_unit(
-                        label_map, pm, frames, bounds, ref_gsd,
-                        unit_m=cfg.panel_unit_m,
-                        max_k=cfg.max_offnadir_ratio,
-                        hard_k_mult=cfg.panel_unit_k_mult,
-                        images=coarse_smalls,
-                        img_scale=0.25,
-                        glint_weight=cfg.panel_unit_glint_weight)
-                    _panel_unit_info = _pu
+                logger.info("시임 재배치 생략 — 패널 면적비 %.1f%% 가 타당 "
+                            "범위를 벗어납니다", frac * 100)
         except Exception as exc:
-            logger.warning("패널 기반 처리 실패 (계속 진행): %s", exc)
+            logger.warning("시임 재배치 실패 (계속 진행): %s", exc)
 
     # ★ 2층 높이맵은 '단일 평면 저해상도 정사영상' 이 있어야 만들 수 있는데,
     #   그것이 바로 라벨맵 패스의 부산물이다. 여기서 콜백으로 넘겨 준다.
@@ -1096,12 +1065,6 @@ def mosaic_frames(frames: list[FrameHomography],
         "max_offnadir_ratio": cfg.max_offnadir_ratio,
         "dsm": cfg.dsm.stats() if cfg.dsm is not None else None,
         "offnadir_fallback_ratio": n_fallback,
-        # ★ 적용 여부를 남긴다. panel-unit 실행에서 모든 지표가 소수점까지
-        #   동일했는데, summary 에 기록이 없어 "옵션이 안 먹은 것" 인지
-        #   "먹었는데 효과가 없는 것" 인지 구분할 수 없었다.
-        "panel_unit_m": cfg.panel_unit_m,
-        "seam_panel_penalty": cfg.seam_panel_penalty,
-        "panel_unit_info": _panel_unit_info,
         "offnadir_tolerance": cfg.offnadir_tolerance,
         "offnadir_epsilon": cfg.offnadir_epsilon,
         "bounds": {"x_min": x_min, "y_min": y_min, "x_max": x_max, "y_max": y_max},

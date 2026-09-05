@@ -1328,24 +1328,6 @@ def run_homography_pipeline(image_dir: Path,
         ),
         "ortho": stats,
     }
-    # ★ BA 결과 카메라를 저장한다. 이것이 없으면 **BA 가 실제로 무엇을
-    #   고쳤는지 확인할 방법이 없다.** debug_single_frame 은 초기값으로만
-    #   워프할 수 있어 BA 전후 비교가 불가능했다.
-    #
-    #   실측(EWP-서오창IC-2 RGB): 초기값 기준 인접 프레임 어긋남이
-    #   0.75 m (자세 오차 약 0.9°). BA 가 이걸 잡아야 하는데 최종 모자이크가
-    #   여전히 찢어진다면 BA 가 못 잡고 있다는 뜻이다. 그 판별에 필요하다.
-    try:
-        np.savez_compressed(
-            output_dir / "cameras.npz",
-            cams_opt=np.asarray(cams_opt, dtype=np.float64),
-            initial=np.asarray(initial_cameras, dtype=np.float64),
-            paths=np.array([str(m.origin_path) for m in metas]))
-        logger.info("카메라 해 저장: cameras.npz "
-                    "(BA 전후 비교용 — debug_single_frame --use-ba)")
-    except Exception as exc:
-        logger.warning("카메라 해 저장 실패: %s", exc)
-
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
     return summary

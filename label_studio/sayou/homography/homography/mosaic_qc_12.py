@@ -57,7 +57,6 @@ def assess_mosaic(path, gsd_m: float, *,
                   min_panel_frac: float = 0.30,
                   max_shift_m: float = 1.00,
                   read_px: int = 12000,
-                  relief_m: float | None = None,
                   max_blocks: int = 4000) -> dict | None:
     """모자이크를 읽어 패널 영역의 국소 어긋남을 잰다."""
     try:
@@ -176,7 +175,7 @@ def assess_mosaic(path, gsd_m: float, *,
     #   경계의 열 간 점프는 99% 가 64 px(41 cm), 최대 155 px(99 cm) 였다.
     #   시임이 패널 위를 지날 때 Δh·k 만큼 끊기기 때문이다.
     #   중앙값·p90 과 별개로 이 값을 직접 재서 남긴다.
-    out.update(_panel_edge_steps(panel, eff_gsd, relief_m=relief_m))
+    out.update(_panel_edge_steps(panel, eff_gsd))
 
     # ★ 반사(포화) 비율 — 판독 가능성의 직접 지표.
     #   실측에서 패널의 5.0% 가 포화(240+)라 그 자리는 결함을 볼 수 없습니다.
@@ -227,20 +226,9 @@ def assess_mosaic(path, gsd_m: float, *,
     #   0.760 뿐이었고, **버려진 픽셀이 하필 가장 나쁜 것들**이었다. ε 로
     #   되살리자 0.058 m 로 올라갔다. 즉 좋은 값이 아니라 나쁜 데이터를
     #   뺀 값이었다. 공통 영역으로 맞춰 재면 순서가 뒤집힌다.
-    # ★ 이 경고를 무시하고 같은 실수를 세 번 반복했다(tolerance 비교,
-    #   지형면 평가, 예외 끄기 평가). 충전율이 낮으면 **나쁜 영역이 측정
-    #   대상에서 빠져** 중앙값이 좋아 보인다. 품질 개선과 구분되지 않는다.
-    #   그래서 충전율이 낮을 때는 경고를 더 강하게 낸다.
-    _vr = out["valid_ratio"]
-    if _vr < 0.75:
-        logger.warning(
-            "  ★ 유효 영역이 %.1f%% 뿐입니다 — 이 지표를 충전율이 다른 "
-            "결과와 **비교하지 마세요.** 덜 채운 쪽은 나쁜 픽셀이 측정에서 "
-            "빠져 좋아 보입니다. 설정을 비교하려면 두 결과의 **공통 유효 "
-            "영역**에서 재야 합니다.", _vr * 100)
-    else:
-        logger.info("  (유효 영역 %.1f%% — 충전율이 다른 결과끼리 이 값을 "
-                    "직접 비교하지 마세요.)", _vr * 100)
+    logger.info("  (유효 영역 %.1f%% — 충전율이 다른 결과끼리 이 값을 직접 "
+                "비교하지 마세요. 덜 채운 쪽이 나쁜 픽셀을 빼서 좋아 보입니다.)",
+                out["valid_ratio"] * 100)
     if out["panel_misalign_median_m"] > 0.15:
         logger.warning("  패널 어긋남이 %.2f m 로 큽니다 — --offnadir-frac 을 "
                        "낮추거나(예: 0.32) BA 로그를 확인하세요.",
@@ -249,8 +237,7 @@ def assess_mosaic(path, gsd_m: float, *,
 
 
 def _panel_edge_steps(panel: np.ndarray, gsd: float,
-                      max_step_m: float = 1.5,
-                      relief_m: float | None = None) -> dict:
+                      max_step_m: float = 1.5) -> dict:
     """패널 상단 경계선의 열 간 점프 = 시임 단차.
 
     각 열에서 패널이 처음 나타나는 행을 찾고, 이웃 열과의 차이를 본다.
@@ -300,19 +287,12 @@ def _panel_edge_steps(panel: np.ndarray, gsd: float,
 
     # ★ 물리적 상한을 넘는 점프는 시임 단차가 아니다.
     #   단차 = 패널 높이 × k 인데, 패널 1.5 m 에 k=1.0 이어도 1.5 m 다.
-    #   ★ 다만 상한 1.5 m 는 **평지 기준**이었다. 경사지(EWP-서오창IC-2)에서는
-    #     실측 단차가 99% 2.2 m, 최대 10.9 m 였는데 이 상한이 그걸 통째로
-    #     걸러내 QC 가 `edge_step_p99_m 0.246 m` 라는 멀쩡한 값을 냈다.
-    #     지형 기복이 있으면 그만큼 상한을 올려야 실제 단차가 보인다.
-    #
     #   실측에서 최대 13.87 m 가 나왔는데, 그건 패널 연결성분이 L자·계단
     #   모양이라 상단 경계가 성분 안에서도 **정당하게** 크게 뛴 것이다
     #   (행이 합쳐지거나 꺾이는 곳). 정합 오차가 아니라 배치의 형태다.
     #   그런 열은 빼고 재고, 몇 개였는지만 따로 보고한다.
-    # 지형 기복이 알려져 있으면 상한을 그에 맞춰 올린다.
-    lim = max_step_m if not relief_m else max(max_step_m, 2.0 * float(relief_m))
     d_m = d * gsd
-    plausible = d_m <= lim
+    plausible = d_m <= max_step_m
     n_excl = int((~plausible).sum())
     dd = d_m[plausible]
     if dd.size < 100:
@@ -323,7 +303,6 @@ def _panel_edge_steps(panel: np.ndarray, gsd: float,
         "edge_step_over3px_ratio": float((dd > 3 * gsd).mean()),
         "edge_step_columns": int(dd.size),
         "edge_step_excluded": n_excl,
-        "edge_step_limit_m": float(lim),
     }
     logger.info("  패널 경계 단차: 95%% %.3f m, 99%% %.3f m, 3px 초과 %.1f%% "
                 "(열 %d개, 형태성 점프 %d개 제외) — 시임이 패널을 자르면 "
@@ -396,57 +375,3 @@ def _coverage_in_site(valid: np.ndarray) -> float | None:
         return r
     except Exception:
         return None
-
-
-def _row_fragmentation(panel: np.ndarray, gsd: float) -> dict:
-    """패널 **행이 몇 조각으로 끊겼는지** — 사용자가 눈으로 보는 그 문제.
-
-    ★ 왜 별도 지표인가 — ``_panel_edge_steps`` 는 연결성분마다 그 **안에서만**
-      경계선을 따라가므로, 찢어져서 조각난 곳은 서로 다른 성분이 되어 그
-      경계의 점프가 아예 측정에서 빠집니다. 즉 "조각 내부의 매끄러움" 만
-      재고 "조각들이 서로 어긋난 정도" 는 못 봅니다.
-
-      실측(EWP-서오창IC-2 경사지)에서 그 차이가 드러났습니다:
-
-      | 측정 | 값 |
-      |---|---|
-      | ``edge_step_p99_m`` (성분 내부) | 0.335 m |
-      | 열별 첫 패널 픽셀 점프 (성분 간) | **2.22 m** |
-      | 눈으로 본 상태 | 행이 심하게 찢어짐 |
-
-      성분별로 나눈 것은 원래 '행 사이 건너뛰기' 를 막으려던 것인데, 그
-      대가로 정작 찢어짐을 못 보게 됐습니다. 그래서 **조각 수를 직접**
-      셉니다 — 한 행이 여러 조각이면 그만큼 끊긴 것입니다.
-    """
-    if panel.sum() < 1000:
-        return {}
-    n, lab, st, _ = cv2.connectedComponentsWithStats(
-        panel.astype(np.uint8), 8)
-    min_px = max(int(2.0 / max(gsd, 1e-6)) ** 2 // 40, 200)
-    areas = st[1:, cv2.CC_STAT_AREA]
-    widths = st[1:, cv2.CC_STAT_WIDTH]
-    big = (areas >= min_px)
-    if big.sum() < 2:
-        return {}
-    # 행 주기: 패널 행 프로파일의 주기로 행 수를 추정한다.
-    prof = panel.mean(axis=1)
-    sp = np.abs(np.fft.rfft(prof - prof.mean()))
-    kbin = int(np.argmax(sp[3:min(120, len(sp))])) + 3
-    n_rows = max(kbin, 1)
-    n_frag = int(big.sum())
-    res = {
-        "panel_fragments": n_frag,
-        "rows_estimated": int(n_rows),
-        "fragments_per_row": float(n_frag / max(n_rows, 1)),
-        "fragment_width_median_m": float(np.median(widths[big]) * gsd),
-    }
-    logger.info("  패널 조각: %d개 / 행 %d개 추정 = 행당 %.1f조각 "
-                "(조각 폭 중앙값 %.1f m) — 행당 1에 가까울수록 온전합니다. "
-                "크면 시임에서 행이 끊긴 것입니다.",
-                n_frag, n_rows, res["fragments_per_row"],
-                res["fragment_width_median_m"])
-    # ★ 검증 실패로 **사용하지 않는다.** EWP(찢어짐) 행당 9.2조각 vs
-    #   그린(양호) 행당 15.3조각으로 오히려 뒤집혔다. 패널이 원래 모듈
-    #   단위로 나뉘어 있어 이 값이 찢어짐이 아니라 **모듈 개수**를 센다
-    #   (GSD 가 미세할수록 잘게 분리됨). 참고용으로만 남긴다.
-    return res

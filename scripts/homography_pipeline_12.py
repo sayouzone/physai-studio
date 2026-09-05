@@ -174,57 +174,6 @@ def parse_args() -> argparse.Namespace:
                         "이 값을 넘으면 기각한다. 로그에 '산포가 작아 추정 "
                         "자체는 일관됩니다' 가 뜨면 그 크기 이상으로 올려 "
                         "시험해 볼 가치가 있다 (극동대: Δz -4.5~-6.2 m)")
-    p.add_argument("--rtk-match-check", dest="rtk_match_check",
-                   action="store_true",
-                   help="매칭된 쌍의 변위를 RTK 예측과 비교해 '한 줄 건너뛴' "
-                        "오매칭 쌍을 버린다. 반복 격자(패널 줄무늬)에서 SIFT 가 "
-                        "옆 줄을 같은 줄로 착각하는데, 그 오매칭은 기하학적으로 "
-                        "자기일관적이라 RANSAC·BA 가 못 거른다 (실측 10쌍 중 "
-                        "7쌍이 주기의 정수배로 어긋남)")
-    p.add_argument("--rtk-check-frac", dest="rtk_check_frac", type=float,
-                   default=0.5,
-                   help="줄무늬 주기의 몇 배 이상 어긋나면 기각할지. 0.5 면 "
-                        "'주기의 절반 이상 어긋나면 버린다'")
-    p.add_argument("--stripe-pitch-px", dest="stripe_pitch_px", type=float,
-                   default=0.0,
-                   help="줄무늬 주기를 직접 지정 (px). 0 이면 원본에서 자동 측정")
-    p.add_argument("--min-frame-obs", dest="min_frame_observations",
-                   type=int, default=0,
-                   help="이 개수 미만의 관측을 가진 프레임을 모자이크에서 "
-                        "제외한다. 0 이면 끔. tie point 가 없는 프레임은 BA "
-                        "보정을 전혀 못 받고 RTK/짐벌 값 그대로라 주변과 크게 "
-                        "어긋난다 (실측 909장 중 25장). 50~100 부터 시험")
-    p.add_argument("--terrain-fit", dest="terrain_fit", action="store_true",
-                   help="경사지용 저차 다항 지형면. 단일 평면이 경사지에서 "
-                        "무너져 패널 행이 찢어지는 것을 막는다 (실측 경사지에서 "
-                        "행 단차 99%% 2.01m, 최대 5.82m). 전역 적합이라 DSM 이 "
-                        "실패하는 점 밀도에서도 성립. 평지에서는 잔차가 줄지 "
-                        "않아 자동 미채택")
-    p.add_argument("--terrain-cell", dest="terrain_cell_m", type=float,
-                   default=1.0,
-                   help="지형면을 구울 DSM 격자 크기 (m). 다항면은 매끄러워서 "
-                        "1 m 면 충분하다")
-    p.add_argument("--terrain-degree", dest="terrain_degree", type=int,
-                   default=2, help="지형면 차수 (1=평면, 2=2차)")
-    p.add_argument("--panel-unit", dest="panel_unit_m", type=float, default=0.0,
-                   help="프레임 배정 단위 (m). 0 이면 기존 픽셀 단위. 값을 주면 "
-                        "그 크기의 패널 단위를 통째로 한 프레임에서 가져와 "
-                        "시임이 패널을 가로지르지 않는다. 2~3 이 적당하며, "
-                        "한 프레임이 덮을 수 있는 크기여야 한다 "
-                        "(k≤0.15, 고도 45m 면 유효반경 6.7m)")
-    p.add_argument("--panel-unit-glint", dest="panel_unit_glint_weight",
-                   type=float, default=0.0,
-                   help="패널 단위를 고를 때 반사(포화) 회피 가중치. 기본 0(끔) "
-                        "— 실측에서 5.01%% → 5.00%% 로 효과가 없었다. 시임 선택이 "
-                        "이미 덜 포화된 프레임을 고르고 있어(원본 7~11%% vs "
-                        "모자이크 5%%) 짜낼 여지가 소진된 상태. 태양 조건이 "
-                        "다른 촬영에서는 시험해 볼 만하다")
-    p.add_argument("--panel-unit-k-mult", dest="panel_unit_k_mult",
-                   type=float, default=3.0,
-                   help="패널 단위 배정에서 --offnadir-frac 상한의 몇 배까지 "
-                        "허용할지. 라벨맵은 픽셀별로 완화된 k 를 쓰므로 단위 "
-                        "배정도 같은 여유가 필요하다 (하드 상한이면 실측에서 "
-                        "29%%가 배정 불가였음)")
     p.add_argument("--seam-panel-penalty", dest="seam_panel_penalty",
                    type=float, default=0.0,
                    help="시임이 패널 위를 지날 때의 벌점. 패널 상면은 기준면보다 "
@@ -395,16 +344,6 @@ def main() -> None:
         seam_optimize=args.seam_optimize,
         seam_cost_weight=args.seam_cost_weight,
         seam_panel_penalty=args.seam_panel_penalty,
-        panel_unit_m=args.panel_unit_m,
-        terrain_fit=args.terrain_fit,
-        min_frame_observations=args.min_frame_observations,
-        rtk_match_check=args.rtk_match_check,
-        rtk_check_frac=args.rtk_check_frac,
-        stripe_pitch_px=args.stripe_pitch_px,
-        terrain_degree=args.terrain_degree,
-        terrain_cell_m=args.terrain_cell_m,
-        panel_unit_k_mult=args.panel_unit_k_mult,
-        panel_unit_glint_weight=args.panel_unit_glint_weight,
         exposure_compensate=args.exposure_compensate,
         thermal_auto=args.thermal_auto,
         glint_penalty=args.glint_penalty,
@@ -452,10 +391,7 @@ def main() -> None:
                  "estimate_distortion", "mid_reproj_factor", "fix_positions",
                  "plane_tilt_tolerance_deg", "offnadir_frac", "auto_focal",
                  "use_feature_cache", "prefetch_workers", "layer_surface",
-                 "use_two_layer", "two_layer_auto", "thermal_auto",
-                 "panel_unit_m", "seam_panel_penalty", "terrain_fit",
-                 "rtk_match_check",
-                 "plane_shift_limit_m", "plane_lrf_tolerance_m"]
+                 "use_two_layer"]
         for _k in _need:
             print(f"  pipeline.py  {_k:24} "
                   f"{'있음' if _k in _accepted else '없음 ← 갱신 필요'}")
@@ -471,32 +407,11 @@ def main() -> None:
                             for p in _ins.signature(_MC.__init__)
                             .parameters.values())
             for _k in ["two_layer_builder", "dsm", "prefetch_workers",
-                       "offnadir_frac", "tile_memory_mb",
-                       "panel_unit_m", "seam_panel_penalty", "terrain_fit",
-                 "rtk_match_check",
-                       "offnadir_epsilon", "offnadir_tolerance"]:
+                       "offnadir_frac", "tile_memory_mb"]:
                 print(f"  ortho.py     {_k:24} "
                       f"{'있음' if _k in _mc else '없음 ← 갱신 필요'}")
             print(f"  ortho.py     {'미지원 인자 허용':24} "
                   f"{'예' if _tolerant else '아니오 ← 갱신 권장'}")
-            # ★ 새 모듈은 '있는지' 자체를 봐야 한다. 없으면 옵션이 조용히
-            #   무시되어 "정상 실행됐는데 결과가 완전히 동일" 해진다
-            #   (실측: --panel-unit 2 를 줬는데 모든 지표가 소수점까지 같음).
-            for _mod, _fn in [("rtk_match_check", "filter_matches_by_rtk"),
-                              ("terrain", "fit_terrain_surface"),
-                              ("panel_units", "consolidate_labels_by_unit"),
-                              ("two_layer", "build_two_layer_dsm"),
-                              ("mosaic_qc", "assess_mosaic"),
-                              ("distortion", "estimate_radial_distortion")]:
-                try:
-                    _m = __import__(
-                        f"solar_thermal.georeferencing.homography.{_mod}",
-                        fromlist=[_fn])
-                    _ok = hasattr(_m, _fn)
-                except Exception:
-                    _ok = False
-                print(f"  모듈         {_mod + '.py':24} "
-                      f"{'있음' if _ok else '없음 ← 새 파일 추가 필요'}")
         except Exception as _e:
             print(f"  ortho.py 확인 실패: {_e}")
         raise SystemExit(0)

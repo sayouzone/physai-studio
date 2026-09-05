@@ -208,9 +208,6 @@ def run_homography_pipeline(image_dir: Path,
                  gsd_m: float | None = None,
                  device: str = "mps",
                  k_neighbors: int = 8,
-                 rtk_match_check: bool = False,
-                 rtk_check_frac: float = 0.5,
-                 stripe_pitch_px: float = 0.0,
                  geoid_undulation_m: float = 0.0,
                  skip_sfm: bool = False,
                  mosaic: bool = True,
@@ -341,7 +338,6 @@ def run_homography_pipeline(image_dir: Path,
     obs_cnt_final = None
     focal_info = None
     terrain_info = None
-    match_check_info = None
     excluded_weak_frames = 0
     distortion_info = None
 
@@ -377,53 +373,6 @@ def run_homography_pipeline(image_dir: Path,
         else:
             matches, features = build_tie_points(metas, pairs)
             _cache.save(metas, pairs, _ckey, matches, features)
-
-        # ★ 반복 격자의 '한 줄 건너뛴' 오매칭을 **쌍 단위**로 거른다.
-        #
-        #   실측(EWP-서오창IC-2 IR 원본 10장): 줄무늬 주기 160 px 인데
-        #   쌍별 변위가 주기의 정수배에 몰렸다 — 10쌍 중 7쌍이 정수배
-        #   ±0.25 이내(무작위면 50%). 이런 오매칭은 기하학적으로
-        #   자기일관적이라 RANSAC 도 BA 도 못 거른다.
-        #
-        #   ★ 처음에는 RTK 예측 **반경 안에서만 대응을 찾는** 방식을 썼다가
-        #     실패했다. 반경은 주기의 절반(80 px) 미만이어야 하는데, 예측
-        #     오차가 짐벌 0.9°(11 px) + 지형 기복 5 m(71 px) = 82 px 로
-        #     이미 그 한계를 넘는다. 반경 64 px 로 돌리니 정상 대응까지 잘려
-        #     zero_frames 가 25 → 37 로 늘고 총 점이 11% 줄었다.
-        #
-        #   대신 **쌍 전체의 변위**를 본다. 쌍 안의 대응 수십~수백 개가 함께
-        #   어긋나므로 중앙값은 개별 예측 오차에 둔감하고, 오차 82 px 와
-        #   주기 160 px 는 충분히 벌어져 있다.
-        if rtk_match_check:
-            try:
-                from .homography.rtk_match_check import (
-                    filter_matches_by_rtk, estimate_stripe_pitch_px)
-                _pitch = (stripe_pitch_px if stripe_pitch_px > 0 else
-                          estimate_stripe_pitch_px(
-                              [m.origin_path for m in metas]))
-                if _pitch:
-                    _z0 = [z for z in (estimate_ground_z(m) for m in metas)
-                           if z is not None]
-                    _plane0 = GroundPlane.horizontal(
-                        float(np.median(_z0)) if _z0 else 0.0)
-                    _prov = []
-                    for _i, (_m, _k) in enumerate(zip(metas, intrinsics_obj)):
-                        if _k is None:
-                            _prov.append(None); continue
-                        _C = initial_cameras[_i, :3]
-                        _R = _rotation_from_opk(*initial_cameras[_i, 3:6])
-                        _prov.append(build_frame_homography(
-                            _C, _R, _k, _plane0))
-                    if all(f is not None for f in _prov):
-                        matches, _mc = filter_matches_by_rtk(
-                            matches, _prov, pitch_px=_pitch,
-                            reject_frac=rtk_check_frac)
-                        match_check_info = _mc
-                else:
-                    logger.info("줄무늬 주기를 잴 수 없어 RTK 쌍 검사를 "
-                                "건너뜁니다")
-            except Exception as exc:
-                logger.warning("RTK 쌍 검사 실패 (기존 매칭 유지): %s", exc)
         logger.info("[stage] SfM 매칭: %s", fmt_elapsed(time.perf_counter() - t0))
 
         # ---- 5a. track --------------------------------------------------
@@ -1293,7 +1242,6 @@ def run_homography_pipeline(image_dir: Path,
         "plane_tilt_check": plane_tilt,
         "focal_calibration": focal_info,
         "terrain_fit": terrain_info,
-        "rtk_match_check": match_check_info,
         "excluded_weak_frames": excluded_weak_frames,
         "distortion": distortion_info,
         # ★ ortho 단계 안에서 two_layer_builder 가 별도로 높이맵을 만들 수
@@ -1328,56 +1276,9 @@ def run_homography_pipeline(image_dir: Path,
         ),
         "ortho": stats,
     }
-    # ★ BA 결과 카메라를 저장한다. 이것이 없으면 **BA 가 실제로 무엇을
-    #   고쳤는지 확인할 방법이 없다.** debug_single_frame 은 초기값으로만
-    #   워프할 수 있어 BA 전후 비교가 불가능했다.
-    #
-    #   실측(EWP-서오창IC-2 RGB): 초기값 기준 인접 프레임 어긋남이
-    #   0.75 m (자세 오차 약 0.9°). BA 가 이걸 잡아야 하는데 최종 모자이크가
-    #   여전히 찢어진다면 BA 가 못 잡고 있다는 뜻이다. 그 판별에 필요하다.
-    try:
-        np.savez_compressed(
-            output_dir / "cameras.npz",
-            cams_opt=np.asarray(cams_opt, dtype=np.float64),
-            initial=np.asarray(initial_cameras, dtype=np.float64),
-            paths=np.array([str(m.origin_path) for m in metas]))
-        logger.info("카메라 해 저장: cameras.npz "
-                    "(BA 전후 비교용 — debug_single_frame --use-ba)")
-    except Exception as exc:
-        logger.warning("카메라 해 저장 실패: %s", exc)
-
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
     return summary
-
-
-def _estimate_stripe_pitch_px(metas, n_sample: int = 3):
-    """원본 몇 장에서 **패널 줄무늬 주기**(px)를 잰다.
-
-    반복 격자에서 RTK 유도 탐색 반경을 정하는 데 쓴다. 반경이 주기의
-    절반을 넘으면 '한 줄 건너뛴' 대응이 예측 반경 안에 들어와 걸러지지
-    않는다 (실측 주기 160 px 인데 기본 반경이 200 px 였다).
-    """
-    import cv2 as _cv
-    vals = []
-    for m in metas[:max(n_sample, 1)]:
-        try:
-            im = _cv.imread(str(m.origin_path), _cv.IMREAD_GRAYSCALE)
-            if im is None:
-                continue
-            H, W = im.shape
-            for prof in (im.mean(axis=0), im.mean(axis=1)):
-                pr = prof.astype(float) - float(prof.mean())
-                sp = np.abs(np.fft.rfft(pr))
-                if len(sp) < 8:
-                    continue
-                k = int(np.argmax(sp[3:min(60, len(sp))])) + 3
-                vals.append(len(pr) / k)
-        except Exception:
-            continue
-    if not vals:
-        return None
-    return float(np.median(vals))
 
 
 def _rotation_from_opk(omega, phi, kappa):

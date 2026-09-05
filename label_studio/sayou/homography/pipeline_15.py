@@ -208,9 +208,6 @@ def run_homography_pipeline(image_dir: Path,
                  gsd_m: float | None = None,
                  device: str = "mps",
                  k_neighbors: int = 8,
-                 rtk_match_check: bool = False,
-                 rtk_check_frac: float = 0.5,
-                 stripe_pitch_px: float = 0.0,
                  geoid_undulation_m: float = 0.0,
                  skip_sfm: bool = False,
                  mosaic: bool = True,
@@ -220,8 +217,6 @@ def run_homography_pipeline(image_dir: Path,
                  auto_plane: bool = True,
                  terrain_fit: bool = False,
                  terrain_degree: int = 2,
-                 terrain_cell_m: float = 1.0,
-                 min_frame_observations: int = 0,
                  coarse_reproj_px: float = 0.0,
                  fine_reproj_px: float = 3.0,
                  ba_stage1_attitude_deg: float = 1.5,
@@ -338,11 +333,8 @@ def run_homography_pipeline(image_dir: Path,
     pts_opt = None
     ba_rmse = None
     obs_stats = None
-    obs_cnt_final = None
     focal_info = None
     terrain_info = None
-    match_check_info = None
-    excluded_weak_frames = 0
     distortion_info = None
 
     if not skip_sfm:
@@ -377,53 +369,6 @@ def run_homography_pipeline(image_dir: Path,
         else:
             matches, features = build_tie_points(metas, pairs)
             _cache.save(metas, pairs, _ckey, matches, features)
-
-        # ★ 반복 격자의 '한 줄 건너뛴' 오매칭을 **쌍 단위**로 거른다.
-        #
-        #   실측(EWP-서오창IC-2 IR 원본 10장): 줄무늬 주기 160 px 인데
-        #   쌍별 변위가 주기의 정수배에 몰렸다 — 10쌍 중 7쌍이 정수배
-        #   ±0.25 이내(무작위면 50%). 이런 오매칭은 기하학적으로
-        #   자기일관적이라 RANSAC 도 BA 도 못 거른다.
-        #
-        #   ★ 처음에는 RTK 예측 **반경 안에서만 대응을 찾는** 방식을 썼다가
-        #     실패했다. 반경은 주기의 절반(80 px) 미만이어야 하는데, 예측
-        #     오차가 짐벌 0.9°(11 px) + 지형 기복 5 m(71 px) = 82 px 로
-        #     이미 그 한계를 넘는다. 반경 64 px 로 돌리니 정상 대응까지 잘려
-        #     zero_frames 가 25 → 37 로 늘고 총 점이 11% 줄었다.
-        #
-        #   대신 **쌍 전체의 변위**를 본다. 쌍 안의 대응 수십~수백 개가 함께
-        #   어긋나므로 중앙값은 개별 예측 오차에 둔감하고, 오차 82 px 와
-        #   주기 160 px 는 충분히 벌어져 있다.
-        if rtk_match_check:
-            try:
-                from .homography.rtk_match_check import (
-                    filter_matches_by_rtk, estimate_stripe_pitch_px)
-                _pitch = (stripe_pitch_px if stripe_pitch_px > 0 else
-                          estimate_stripe_pitch_px(
-                              [m.origin_path for m in metas]))
-                if _pitch:
-                    _z0 = [z for z in (estimate_ground_z(m) for m in metas)
-                           if z is not None]
-                    _plane0 = GroundPlane.horizontal(
-                        float(np.median(_z0)) if _z0 else 0.0)
-                    _prov = []
-                    for _i, (_m, _k) in enumerate(zip(metas, intrinsics_obj)):
-                        if _k is None:
-                            _prov.append(None); continue
-                        _C = initial_cameras[_i, :3]
-                        _R = _rotation_from_opk(*initial_cameras[_i, 3:6])
-                        _prov.append(build_frame_homography(
-                            _C, _R, _k, _plane0))
-                    if all(f is not None for f in _prov):
-                        matches, _mc = filter_matches_by_rtk(
-                            matches, _prov, pitch_px=_pitch,
-                            reject_frac=rtk_check_frac)
-                        match_check_info = _mc
-                else:
-                    logger.info("줄무늬 주기를 잴 수 없어 RTK 쌍 검사를 "
-                                "건너뜁니다")
-            except Exception as exc:
-                logger.warning("RTK 쌍 검사 실패 (기존 매칭 유지): %s", exc)
         logger.info("[stage] SfM 매칭: %s", fmt_elapsed(time.perf_counter() - t0))
 
         # ---- 5a. track --------------------------------------------------
@@ -798,7 +743,6 @@ def run_homography_pipeline(image_dir: Path,
                                 "  보정된 f 로 느슨한 단계를 다시 실행합니다 "
                                 "(게이트 %.0f px) — 정밀 단계로 바로 가면 "
                                 "점을 전부 잃습니다.", loose_px)
-                obs_cnt_final = obs_cnt.copy()
                 obs_stats = {
                     "median": float(np.median(obs_cnt)),
                     "min": float(obs_cnt.min()),
@@ -816,10 +760,7 @@ def run_homography_pipeline(image_dir: Path,
                                   panel_top_offset_m=panel_top_offset_m,
                                   surface=plane_surface)
 
-    # ★ 원본 인덱스를 함께 보관한다. 아래에서 관측 수(metas 기준)로
-    #   프레임을 거를 때, frames 는 여기서 일부 제외될 수 있어 위치만으로
-    #   맞추면 **엉뚱한 프레임을 지운다.**
-    frames, frame_metas, frame_src_idx = [], [], []
+    frames, frame_metas = [], []
     for i, (m, k) in enumerate(zip(metas, intrinsics_obj)):
         C = cams_opt[i, :3]
         R = _rotation_from_opk(cams_opt[i, 3], cams_opt[i, 4], cams_opt[i, 5])
@@ -834,7 +775,6 @@ def run_homography_pipeline(image_dir: Path,
             continue
         frames.append(fh)
         frame_metas.append(m)
-        frame_src_idx.append(i)
 
     if not frames:
         raise ValueError("호모그래피를 구성할 수 있는 프레임이 없습니다")
@@ -1145,86 +1085,16 @@ def run_homography_pipeline(image_dir: Path,
     #   평지에서는 잔차가 줄지 않아 자동으로 미채택됩니다.
     if terrain_fit and pts_opt is not None and plane is not None:
         try:
-            from .homography.terrain import (fit_terrain_surface,
-                                              diagnose_height_scatter)
-            # ★ 먼저 평면 잔차가 **실제 지형**인지 **점군 잡음**인지 가른다.
-            #   잡음에 곡면을 맞추면 중앙이 왜곡된다 — 실측(EWP)에서 2차
-            #   다항 적용 후 단차가 1.69 → 2.22 m 로 나빠졌고 잘라낸
-            #   이미지에 다항 등고선 모양의 타원 경계가 나타났다.
-            _scat = diagnose_height_scatter(pts_opt, plane)
-            _tinfo = {}
-            if _scat and _scat["verdict"] == "point_noise":
-                logger.warning(
-                    "지형면 생략: 평면 잔차가 실제 지형이 아니라 점군 잡음"
-                    "입니다 (셀 내 산포 %.2f m ≥ 셀 간 변화 %.2f m). "
-                    "잡음에 곡면을 맞추면 중앙이 왜곡됩니다.",
-                    _scat["within_cell_scatter_m"],
-                    _scat["between_cell_variation_m"])
-                _surf = None
-                _tinfo = {"scatter": _scat, "reason": "point_noise"}
-            else:
-                _surf, _tinfo = fit_terrain_surface(
-                    pts_opt, plane, degree=terrain_degree)
-                _tinfo = dict(_tinfo or {}); _tinfo["scatter"] = _scat
-            # ★ 채택되든 아니든 **진단을 남긴다.** 처음엔 채택된 경우만
-            #   기록해서, 미채택 시 summary 의 terrain_fit 이 그냥 null 이라
-            #   "왜 안 됐는지" 를 알 수 없었다. 실측에서 정확히 그 상황이
-            #   나와 원인 추적이 막혔다.
-            terrain_info = dict(_tinfo or {})
-            terrain_info["adopted"] = False
+            from .homography.terrain import fit_terrain_surface
+            _surf, _tinfo = fit_terrain_surface(
+                pts_opt, plane, degree=terrain_degree)
             if _surf is not None:
-                # ★ `plane` 을 PolyTerrain 으로 바꿔치기하지 않는다.
-                #   build_frame_homography 가 GroundPlane 내부 구현
-                #   (local_coeffs 등)에 의존해 AttributeError 로 죽었다.
-                #   그 함수는 이 트리에 없는 homography.py 안에 있어
-                #   **인터페이스를 확인하지 않고 추측한 것**이 원인이었다.
-                #
-                #   대신 이미 검증된 DSM 경로로 넘긴다. 다항면을 DSM 격자에
-                #   구우면 알 수 없는 인터페이스를 건드리지 않고 비평면
-                #   지형을 그대로 쓸 수 있다.
-                from .homography.terrain import terrain_to_dsm
-                _fb = [f.footprint_bounds() for f in frames]
-                _fb = [b for b in _fb if b is not None]
-                if _fb:
-                    _arr = np.array(_fb)
-                    _tdsm = terrain_to_dsm(
-                        _surf,
-                        (float(_arr[:, 0].min()), float(_arr[:, 1].min()),
-                         float(_arr[:, 2].max()), float(_arr[:, 3].max())),
-                        cell_m=terrain_cell_m)
-                    if _tdsm is not None:
-                        dsm_obj = _tdsm
-                        terrain_info["adopted"] = True
+                plane = _surf
+                frames = [build_frame_homography(f.camera_xyz, f.R, f.intr,
+                                                 plane) for f in frames]
+                terrain_info = _tinfo
         except Exception as exc:
             logger.warning("지형면 적합 실패 (평면 유지): %s", exc)
-            terrain_info = {"adopted": False, "error": str(exc)}
-
-    # ★ 관측이 없는(또는 극히 적은) 프레임은 **BA 보정을 전혀 못 받고**
-    #   RTK/짐벌 값 그대로 놓인다. 그런 프레임이 모자이크에 섞이면 주변과
-    #   크게 어긋나 패널 행이 통째로 끊겨 보인다.
-    #
-    #   ★ 실측 결과 이 가설은 **기각됐습니다.** `--min-frame-obs 100` 으로
-    #     77장을 뺐더니:
-    #       - 중앙 문제는 그대로
-    #       - IR 충전율 0.541 → 0.514 로 손실만 발생
-    #       - **RGB 는 원형 구멍이 다수 생기고 우측이 대량 결손**
-    #     제외된 프레임들이 그 영역을 **유일하게 덮던** 것이었습니다.
-    #     기본값 0(끔)을 유지하고, 커버리지 여유가 확인된 경우에만 쓰세요.
-    if min_frame_observations > 0 and obs_cnt_final is not None:
-        _oc = np.asarray(obs_cnt_final)
-        _weak = np.array([(_oc[i] < min_frame_observations)
-                          if i < len(_oc) else False
-                          for i in frame_src_idx])
-        if _weak.any() and (~_weak).sum() >= 10:
-            logger.warning(
-                "관측 부족 프레임 %d장 제외 (기준 %d개 미만). 이 프레임들은 "
-                "BA 보정을 못 받아 RTK/짐벌 값 그대로라 주변과 어긋납니다. "
-                "충전율이 그만큼 떨어집니다 — --min-frame-obs 0 으로 끌 수 "
-                "있습니다.", int(_weak.sum()), min_frame_observations)
-            frames = [f for f, w in zip(frames, _weak) if not w]
-            frame_metas = [m for m, w in zip(frame_metas, _weak) if not w]
-            frame_src_idx = [i for i, w in zip(frame_src_idx, _weak) if not w]
-            excluded_weak_frames = int(_weak.sum())
 
     # ---- 8. 정사영상 -----------------------------------------------------
     t0 = time.perf_counter()
@@ -1271,12 +1141,7 @@ def run_homography_pipeline(image_dir: Path,
     if mosaic and stats.get("output_path"):
         try:
             from .homography.mosaic_qc import assess_mosaic
-            # 지형 기복을 넘겨 단차 상한이 평지 기준(1.5 m)에 묶이지 않게 한다.
-            _relief = None
-            if (terrain_info or {}).get("adopted"):
-                _relief = terrain_info.get("max_deviation_from_plane_m")
-            qc = assess_mosaic(stats["output_path"], stats.get("gsd_m", gsd_m),
-                               relief_m=_relief)
+            qc = assess_mosaic(stats["output_path"], stats.get("gsd_m", gsd_m))
             if qc:
                 stats["quality"] = qc
         except Exception as exc:
@@ -1293,8 +1158,6 @@ def run_homography_pipeline(image_dir: Path,
         "plane_tilt_check": plane_tilt,
         "focal_calibration": focal_info,
         "terrain_fit": terrain_info,
-        "rtk_match_check": match_check_info,
-        "excluded_weak_frames": excluded_weak_frames,
         "distortion": distortion_info,
         # ★ ortho 단계 안에서 two_layer_builder 가 별도로 높이맵을 만들 수
         #   있는데, 이 상위 필드들이 그것을 반영하지 않았다. 실측
@@ -1305,8 +1168,7 @@ def run_homography_pipeline(image_dir: Path,
         "dsm_used": (dsm_obj is not None
                      or bool(stats.get("dsm"))),
         "surface_model": (
-            "terrain_poly" if (terrain_info or {}).get("adopted")
-            else "layer" if (dsm_obj is not None and layer_surface)
+            "layer" if (dsm_obj is not None and layer_surface)
             else "dsm" if dsm_obj is not None
             else "two_layer" if stats.get("dsm")
             else "plane"),
@@ -1328,56 +1190,9 @@ def run_homography_pipeline(image_dir: Path,
         ),
         "ortho": stats,
     }
-    # ★ BA 결과 카메라를 저장한다. 이것이 없으면 **BA 가 실제로 무엇을
-    #   고쳤는지 확인할 방법이 없다.** debug_single_frame 은 초기값으로만
-    #   워프할 수 있어 BA 전후 비교가 불가능했다.
-    #
-    #   실측(EWP-서오창IC-2 RGB): 초기값 기준 인접 프레임 어긋남이
-    #   0.75 m (자세 오차 약 0.9°). BA 가 이걸 잡아야 하는데 최종 모자이크가
-    #   여전히 찢어진다면 BA 가 못 잡고 있다는 뜻이다. 그 판별에 필요하다.
-    try:
-        np.savez_compressed(
-            output_dir / "cameras.npz",
-            cams_opt=np.asarray(cams_opt, dtype=np.float64),
-            initial=np.asarray(initial_cameras, dtype=np.float64),
-            paths=np.array([str(m.origin_path) for m in metas]))
-        logger.info("카메라 해 저장: cameras.npz "
-                    "(BA 전후 비교용 — debug_single_frame --use-ba)")
-    except Exception as exc:
-        logger.warning("카메라 해 저장 실패: %s", exc)
-
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
     return summary
-
-
-def _estimate_stripe_pitch_px(metas, n_sample: int = 3):
-    """원본 몇 장에서 **패널 줄무늬 주기**(px)를 잰다.
-
-    반복 격자에서 RTK 유도 탐색 반경을 정하는 데 쓴다. 반경이 주기의
-    절반을 넘으면 '한 줄 건너뛴' 대응이 예측 반경 안에 들어와 걸러지지
-    않는다 (실측 주기 160 px 인데 기본 반경이 200 px 였다).
-    """
-    import cv2 as _cv
-    vals = []
-    for m in metas[:max(n_sample, 1)]:
-        try:
-            im = _cv.imread(str(m.origin_path), _cv.IMREAD_GRAYSCALE)
-            if im is None:
-                continue
-            H, W = im.shape
-            for prof in (im.mean(axis=0), im.mean(axis=1)):
-                pr = prof.astype(float) - float(prof.mean())
-                sp = np.abs(np.fft.rfft(pr))
-                if len(sp) < 8:
-                    continue
-                k = int(np.argmax(sp[3:min(60, len(sp))])) + 3
-                vals.append(len(pr) / k)
-        except Exception:
-            continue
-    if not vals:
-        return None
-    return float(np.median(vals))
 
 
 def _rotation_from_opk(omega, phi, kappa):

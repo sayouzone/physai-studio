@@ -143,7 +143,7 @@ class MosaicConfig:
                  seam_panel_penalty: float = 0.0,
                  panel_unit_m: float = 0.0,
                  panel_unit_k_mult: float = 3.0,
-                 panel_unit_glint_weight: float = 0.0,
+                 panel_unit_glint_weight: float = 0.5,
                  seam_cost_blur_m: float = 1.5,
                  exposure_compensate: bool = True,
                  glint_penalty: float = 0.7,
@@ -657,11 +657,6 @@ def _coarse_reference(frames, image_paths, order, bounds, cfg,
     score = np.zeros((oh, ow), dtype=np.float32)
     blur_c = max(int(cfg.seam_cost_blur_m / g), 1)
     gains: dict[int, float] = {}
-    # ★ 패널 단위 반사 판정을 하려면 후보 프레임을 단위에 다시 워프해야 하고,
-    #   그러려면 저해상도 영상이 필요하다. 켜져 있을 때만 보관한다
-    #   (380장 × 0.25배율 grayscale ≈ 480 MB).
-    smalls: dict[int, np.ndarray] = {}
-    _keep_small = (cfg.panel_unit_m > 0 and cfg.panel_unit_glint_weight > 0)
 
     for idx in order:
         img = cv2.imread(str(image_paths[idx]), cv2.IMREAD_GRAYSCALE)
@@ -669,8 +664,6 @@ def _coarse_reference(frames, image_paths, order, bounds, cfg,
             continue
         small = cv2.resize(img, None, fx=0.25, fy=0.25,
                            interpolation=cv2.INTER_AREA)
-        if _keep_small:
-            smalls[idx] = small
         fh = frames[idx]
         H = fh.ortho_pixel_matrix(x_min, y_max, g)
         S = np.diag([0.25, 0.25, 1.0]).astype(np.float64)
@@ -777,7 +770,7 @@ def _coarse_reference(frames, image_paths, order, bounds, cfg,
     logger.info("전역 라벨맵: %d×%d px (GSD %.3f m), 배정된 프레임 %d개 — "
                 "타일 독립 시임 판정", ow, oh, g,
                 int(len(np.unique(label[label >= 0]))))
-    return gains, label, g, canvas, filled, smalls
+    return gains, label, g, canvas, filled
 
 
 def mosaic_frames(frames: list[FrameHomography],
@@ -854,9 +847,8 @@ def mosaic_frames(frames: list[FrameHomography],
                 x_max - x_min, y_max - y_min, n_tiles, tile_h,
                 tile_h * bytes_per_row / 1e6)
 
-    gains, label_map, ref_gsd, coarse_img, coarse_ok, coarse_smalls = \
-        _coarse_reference(frames, image_paths, order, bounds, cfg,
-                          restrict=True)
+    gains, label_map, ref_gsd, coarse_img, coarse_ok = _coarse_reference(
+        frames, image_paths, order, bounds, cfg, restrict=True)
 
     # ★ 패널 마스크가 필요한 두 기능을 하나의 2패스로 묶는다.
     #   (a) 시임 벌점 (--seam-panel-penalty, 기본 0 = 끔)
@@ -887,10 +879,9 @@ def mosaic_frames(frames: list[FrameHomography],
                                             max(0.5 / ref_gsd, 1.0))
                     logger.info("시임 재배치: 패널 %.1f%% 영역에 벌점 %.1f "
                                 "적용", frac * 100, cfg.seam_panel_penalty)
-                    (gains, label_map, ref_gsd, coarse_img, coarse_ok,
-                     coarse_smalls) = _coarse_reference(
-                        frames, image_paths, order, bounds, cfg,
-                        panel_mask=pm_f, restrict=True)
+                    gains, label_map, ref_gsd, coarse_img, coarse_ok = \
+                        _coarse_reference(frames, image_paths, order, bounds,
+                                          cfg, panel_mask=pm_f, restrict=True)
                 if cfg.panel_unit_m > 0:
                     from .panel_units import consolidate_labels_by_unit
                     label_map, _pu = consolidate_labels_by_unit(
@@ -898,8 +889,7 @@ def mosaic_frames(frames: list[FrameHomography],
                         unit_m=cfg.panel_unit_m,
                         max_k=cfg.max_offnadir_ratio,
                         hard_k_mult=cfg.panel_unit_k_mult,
-                        images=coarse_smalls,
-                        img_scale=0.25,
+                        coarse_img=coarse_img,
                         glint_weight=cfg.panel_unit_glint_weight)
                     _panel_unit_info = _pu
         except Exception as exc:

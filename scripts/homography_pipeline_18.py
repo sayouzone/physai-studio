@@ -174,20 +174,16 @@ def parse_args() -> argparse.Namespace:
                         "이 값을 넘으면 기각한다. 로그에 '산포가 작아 추정 "
                         "자체는 일관됩니다' 가 뜨면 그 크기 이상으로 올려 "
                         "시험해 볼 가치가 있다 (극동대: Δz -4.5~-6.2 m)")
-    p.add_argument("--rtk-match-check", dest="rtk_match_check",
+    p.add_argument("--guided-matching", dest="guided_matching",
                    action="store_true",
-                   help="매칭된 쌍의 변위를 RTK 예측과 비교해 '한 줄 건너뛴' "
-                        "오매칭 쌍을 버린다. 반복 격자(패널 줄무늬)에서 SIFT 가 "
-                        "옆 줄을 같은 줄로 착각하는데, 그 오매칭은 기하학적으로 "
-                        "자기일관적이라 RANSAC·BA 가 못 거른다 (실측 10쌍 중 "
-                        "7쌍이 주기의 정수배로 어긋남)")
-    p.add_argument("--rtk-check-frac", dest="rtk_check_frac", type=float,
-                   default=0.5,
-                   help="줄무늬 주기의 몇 배 이상 어긋나면 기각할지. 0.5 면 "
-                        "'주기의 절반 이상 어긋나면 버린다'")
-    p.add_argument("--stripe-pitch-px", dest="stripe_pitch_px", type=float,
-                   default=0.0,
-                   help="줄무늬 주기를 직접 지정 (px). 0 이면 원본에서 자동 측정")
+                   help="RTK 로 탐색을 좁혀 매칭한다. 반복 격자(패널 줄무늬)에서 "
+                        "SIFT 가 '한 줄 건너뛴' 패널을 같은 것으로 착각하는데, "
+                        "그 오매칭은 기하학적으로 자기일관적이라 RANSAC·BA 가 "
+                        "못 거른다. 실측 IR 원본에서 10쌍 중 7쌍이 줄무늬 주기의 "
+                        "정수배로 어긋나 있었다")
+    p.add_argument("--guided-search-px", dest="guided_search_px", type=float,
+                   default=200.0,
+                   help="RTK 예측 주변 탐색 반경 (px). 매칭 쌍이 너무 줄면 상향")
     p.add_argument("--min-frame-obs", dest="min_frame_observations",
                    type=int, default=0,
                    help="이 개수 미만의 관측을 가진 프레임을 모자이크에서 "
@@ -398,9 +394,8 @@ def main() -> None:
         panel_unit_m=args.panel_unit_m,
         terrain_fit=args.terrain_fit,
         min_frame_observations=args.min_frame_observations,
-        rtk_match_check=args.rtk_match_check,
-        rtk_check_frac=args.rtk_check_frac,
-        stripe_pitch_px=args.stripe_pitch_px,
+        guided_matching=args.guided_matching,
+        guided_search_px=args.guided_search_px,
         terrain_degree=args.terrain_degree,
         terrain_cell_m=args.terrain_cell_m,
         panel_unit_k_mult=args.panel_unit_k_mult,
@@ -454,7 +449,6 @@ def main() -> None:
                  "use_feature_cache", "prefetch_workers", "layer_surface",
                  "use_two_layer", "two_layer_auto", "thermal_auto",
                  "panel_unit_m", "seam_panel_penalty", "terrain_fit",
-                 "rtk_match_check",
                  "plane_shift_limit_m", "plane_lrf_tolerance_m"]
         for _k in _need:
             print(f"  pipeline.py  {_k:24} "
@@ -473,7 +467,6 @@ def main() -> None:
             for _k in ["two_layer_builder", "dsm", "prefetch_workers",
                        "offnadir_frac", "tile_memory_mb",
                        "panel_unit_m", "seam_panel_penalty", "terrain_fit",
-                 "rtk_match_check",
                        "offnadir_epsilon", "offnadir_tolerance"]:
                 print(f"  ortho.py     {_k:24} "
                       f"{'있음' if _k in _mc else '없음 ← 갱신 필요'}")
@@ -482,8 +475,7 @@ def main() -> None:
             # ★ 새 모듈은 '있는지' 자체를 봐야 한다. 없으면 옵션이 조용히
             #   무시되어 "정상 실행됐는데 결과가 완전히 동일" 해진다
             #   (실측: --panel-unit 2 를 줬는데 모든 지표가 소수점까지 같음).
-            for _mod, _fn in [("rtk_match_check", "filter_matches_by_rtk"),
-                              ("terrain", "fit_terrain_surface"),
+            for _mod, _fn in [("terrain", "fit_terrain_surface"),
                               ("panel_units", "consolidate_labels_by_unit"),
                               ("two_layer", "build_two_layer_dsm"),
                               ("mosaic_qc", "assess_mosaic"),
