@@ -118,18 +118,34 @@ def main() -> int:
     # ★ BA 결과가 있으면 그것으로 워프한다. 초기값과 나란히 재면
     #   "BA 가 자세 오차를 실제로 잡았는가" 가 바로 나온다.
     if args.use_ba:
+        # ★ 조용히 초기값으로 되돌아가지 않는다. --use-ba 를 명시했는데
+        #   파일이 없거나 안 맞으면 **멈춘다.**
+        #   처음엔 경고만 내고 넘어갔는데, 그 결과 before/after 두 실행이
+        #   글자 그대로 같은 계산을 해서 "BA 전후가 동일" 이라는 무의미한
+        #   결과를 냈다. 조용한 폴백은 시간만 버리게 만든다.
+        if not args.use_ba.exists():
+            logger.error("cameras.npz 가 없습니다: %s", args.use_ba)
+            logger.error("")
+            logger.error("이 파일은 **새 pipeline.py 로 파이프라인을 한 번 "
+                         "돌려야** 생깁니다.")
+            logger.error("경로도 확인하세요 — 파이프라인의 --output-dir 안에 "
+                         "생성됩니다.")
+            logger.error("  예: <output-dir>/cameras.npz")
+            return 2
         try:
             z = np.load(args.use_ba, allow_pickle=True)
             ba = np.asarray(z["cams_opt"], dtype=np.float64)
-            if len(ba) == len(cams):
-                cams = ba
-                _USE_BA[0] = True
-                logger.info("BA 결과로 워프합니다 (%s)", args.use_ba.name)
-            else:
-                logger.warning("cameras.npz 의 프레임 수(%d)가 이미지 수(%d)와 "
-                               "달라 초기값을 씁니다", len(ba), len(cams))
         except Exception as exc:
-            logger.warning("cameras.npz 를 읽지 못해 초기값을 씁니다: %s", exc)
+            logger.error("cameras.npz 를 읽지 못했습니다: %s", exc)
+            return 2
+        if len(ba) != len(cams):
+            logger.error("cameras.npz 의 프레임 수(%d)가 이미지 수(%d)와 "
+                         "다릅니다 — 같은 --image-dir 로 만든 파일인지 "
+                         "확인하세요.", len(ba), len(cams))
+            return 2
+        cams = ba
+        _USE_BA[0] = True
+        logger.info("BA 결과로 워프합니다 (%s)", args.use_ba.name)
     intr = [intrinsics_from_metadata(m) for m in metas]
 
     zs = [z for z in (estimate_ground_z(m) for m in metas) if z is not None]
@@ -232,7 +248,7 @@ def _measure(sel, frames, metas, gsd, warp_one, cv2):
     bf = cv2.BFMatcher()
     logger.info("")
     logger.info("인접 프레임 간 지상 어긋남 (SIFT 대응 기준)")
-    meds = []
+    meds, weak = [], []
     for a, b in zip(sel[:-1], sel[1:]):
         wa, oa = warp_one(a)
         wb, ob = warp_one(b)
@@ -252,6 +268,11 @@ def _measure(sel, frames, metas, gsd, warp_one, cv2):
         if len(good) < 20:
             logger.info("  %d-%d: 대응 부족 (%d개)", a, b, len(good))
             continue
+        # ★ 대응이 적으면 중앙값 자체가 흔들린다. 실측 IR 에서 대응이
+        #   12~51개였고(RGB 는 963~1562개) 그 상태의 어긋남 1.11 m 는
+        #   신뢰하기 어렵다. 몇 개로 잰 값인지 항상 함께 본다.
+        if len(good) < 60:
+            weak.append((a, b, len(good)))
         src = np.float32([k1[x.queryIdx].pt for x in good]) / sc
         dst = np.float32([k2[x.trainIdx].pt for x in good]) / sc
         gx1 = oa[0] + src[:, 0] * gsd; gy1 = oa[1] - src[:, 1] * gsd
@@ -260,6 +281,12 @@ def _measure(sel, frames, metas, gsd, warp_one, cv2):
         meds.append(float(np.median(d)))
         logger.info("  %d-%d: 대응 %d개, 어긋남 중앙값 %.3f m, p90 %.3f m",
                     a, b, len(good), np.median(d), np.percentile(d, 90))
+    if weak:
+        logger.warning("  ★ 대응이 60개 미만인 쌍이 %d개 있습니다 %s — "
+                       "그런 쌍의 어긋남 값은 흔들립니다. 열화상은 특징이 "
+                       "적어 흔한 일이며, 이 경우 숫자보다 이미지를 "
+                       "보십시오.", len(weak),
+                       [f"{a}-{b}({n})" for a, b, n in weak])
     if meds:
         med = float(np.median(meds))
         logger.info("  → 전체 중앙값 %.3f m", med)

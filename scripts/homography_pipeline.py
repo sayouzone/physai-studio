@@ -55,6 +55,10 @@ def parse_args() -> argparse.Namespace:
         if os.path.exists(path):
             return path
         raise FileNotFoundError(filepath)
+    def valid_output_dir(filepath):
+        path = os.path.abspath(os.path.expanduser(filepath))
+        os.makedirs(path, exist_ok=True)
+        return path
 
     p = argparse.ArgumentParser(
         description="Homography 파이프라인 (RTK 기반 호모그래피)",
@@ -63,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image-dir", type=valid_filepath,
                    default="~/Development/sayouzone/solar-thermal/data/solar/그린환경센터/RGB",
                    help="DJI JPG 디렉토리")
-    p.add_argument("--output-dir", type=valid_filepath,
+    p.add_argument("--output-dir", type=valid_output_dir,
                    default="~/Development/sayouzone/solar-thermal/workspace/output",
                    help="GeoTIFF 출력 디렉토리")
     p.add_argument("--glob", dest="glob_pattern", default="*.JPG",
@@ -174,6 +178,35 @@ def parse_args() -> argparse.Namespace:
                         "이 값을 넘으면 기각한다. 로그에 '산포가 작아 추정 "
                         "자체는 일관됩니다' 가 뜨면 그 크기 이상으로 올려 "
                         "시험해 볼 가치가 있다 (극동대: Δz -4.5~-6.2 m)")
+    p.add_argument("--smooth-weak-attitude", dest="smooth_weak_attitude",
+                   action="store_true",
+                   help="관측이 부족한 프레임의 자세를 이웃(쿼터니언 SLERP)에서 "
+                        "보간한다. 실측 확정 원인 — 관측 20개 근처 프레임에서 "
+                        "BA 가 자세를 90~180도 흔들고(대응수-어긋남 상관 -0.86), "
+                        "그 프레임이 모자이크 승자가 되면 주변과 어긋나 찢어진다. "
+                        "같은 원본으로 Sitemark 등 상업 SfM 이 정상 결과를 내는 "
+                        "것은 비행 궤적의 매끄러움을 제약으로 쓰기 때문 — 이 "
+                        "옵션이 그 제약을 재현한다. 재촬영·재매칭 불필요")
+    p.add_argument("--attitude-smooth-min-obs", dest="attitude_smooth_min_obs",
+                   type=int, default=60,
+                   help="이 관측 수 미만인 프레임을 보간 대상으로 삼는다")
+    p.add_argument("--attitude-smooth-max-gap", dest="attitude_smooth_max_gap",
+                   type=int, default=8,
+                   help="양옆 이 프레임 수 이내에 관측 충분한 프레임이 없으면 "
+                        "보간하지 않는다 (너무 먼 보간은 신뢰할 수 없음)")
+    p.add_argument("--pose-from", dest="pose_from", default=None,
+                   help="[실패 — 현재 비활성] 다른 센서의 cameras.npz 에서 "
+                        "자세를 가져오는 시도. 실측에서 모자이크 절반이 "
+                        "부채꼴로 벌어졌다 — RGB 의 kappa(광축 회전각)가 "
+                        "인접 프레임 사이 90~180° 씩 튀는 지점이 있었는데, "
+                        "그 값은 RGB 자신의 X/Y/Z/omega/phi 와 함께 풀려야만 "
+                        "유효해 IR 의 다른 위치·각도에 붙이면 무효해진다. "
+                        "재검토 전까지 지정해도 효과가 없다")
+    p.add_argument("--pose-transfer-refine", dest="pose_transfer_refine",
+                   action="store_true",
+                   help="자세를 전이한 뒤에도 BA 를 돌린다. 기본은 끔 — IR 은 "
+                        "대응이 적어 BA 가 자세를 흐트러뜨린 것이 원인이었으므로 "
+                        "다시 돌리면 같은 문제가 재발한다")
     p.add_argument("--rtk-match-check", dest="rtk_match_check",
                    action="store_true",
                    help="매칭된 쌍의 변위를 RTK 예측과 비교해 '한 줄 건너뛴' "
@@ -398,6 +431,11 @@ def main() -> None:
         panel_unit_m=args.panel_unit_m,
         terrain_fit=args.terrain_fit,
         min_frame_observations=args.min_frame_observations,
+        pose_from=args.pose_from,
+        smooth_weak_attitude=args.smooth_weak_attitude,
+        attitude_smooth_min_obs=args.attitude_smooth_min_obs,
+        attitude_smooth_max_gap=args.attitude_smooth_max_gap,
+        pose_transfer_refine=args.pose_transfer_refine,
         rtk_match_check=args.rtk_match_check,
         rtk_check_frac=args.rtk_check_frac,
         stripe_pitch_px=args.stripe_pitch_px,
@@ -446,7 +484,7 @@ def main() -> None:
     import inspect
     _accepted = set(inspect.signature(run_homography_pipeline).parameters)
     if args.check_version:
-        import solar_thermal.georeferencing.pipeline as _pm
+        import sayou.homography.pipeline as _pm
         print(f"pipeline.py: {getattr(_pm, '__file__', '?')}")
         _need = ["coarse_ba_ftol", "fine_gate_auto", "auto_distortion",
                  "estimate_distortion", "mid_reproj_factor", "fix_positions",
@@ -454,6 +492,7 @@ def main() -> None:
                  "use_feature_cache", "prefetch_workers", "layer_surface",
                  "use_two_layer", "two_layer_auto", "thermal_auto",
                  "panel_unit_m", "seam_panel_penalty", "terrain_fit",
+                 "pose_from",
                  "rtk_match_check",
                  "plane_shift_limit_m", "plane_lrf_tolerance_m"]
         for _k in _need:
@@ -463,7 +502,7 @@ def main() -> None:
         # 같은 불일치로 죽은 적이 있다.
         try:
             import inspect as _ins
-            from solar_thermal.georeferencing.homography.ortho import (
+            from sayou.homography.homography.ortho import (
                 MosaicConfig as _MC)
             print(f"ortho.py: {getattr(_MC, '__module__', '?')}")
             _mc = set(_ins.signature(_MC.__init__).parameters)
@@ -473,6 +512,7 @@ def main() -> None:
             for _k in ["two_layer_builder", "dsm", "prefetch_workers",
                        "offnadir_frac", "tile_memory_mb",
                        "panel_unit_m", "seam_panel_penalty", "terrain_fit",
+                 "pose_from",
                  "rtk_match_check",
                        "offnadir_epsilon", "offnadir_tolerance"]:
                 print(f"  ortho.py     {_k:24} "
@@ -482,7 +522,8 @@ def main() -> None:
             # ★ 새 모듈은 '있는지' 자체를 봐야 한다. 없으면 옵션이 조용히
             #   무시되어 "정상 실행됐는데 결과가 완전히 동일" 해진다
             #   (실측: --panel-unit 2 를 줬는데 모든 지표가 소수점까지 같음).
-            for _mod, _fn in [("rtk_match_check", "filter_matches_by_rtk"),
+            for _mod, _fn in [("attitude_smoothing", "smooth_weak_attitudes"),
+                              ("rtk_match_check", "filter_matches_by_rtk"),
                               ("terrain", "fit_terrain_surface"),
                               ("panel_units", "consolidate_labels_by_unit"),
                               ("two_layer", "build_two_layer_dsm"),

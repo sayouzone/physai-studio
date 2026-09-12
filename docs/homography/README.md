@@ -418,11 +418,11 @@ python -m label_studio.sayou.homography.homography.selftest
 python scripts/homography_pipeline.py \
     --image-dir ./data/solar/images/RGB \
     --output-dir ./workspace/output
-```
+````
 
 ```bash
 python scripts/homography_pipeline.py \
-    --image-dir ~/Development/sayouzone/solar-thermal/data/solar/images/RGB \
+    --image-dir ~/Development/sayouzone/solar-thermal/data/solar/그린환경센터/RGB \
     --output-dir ~/Development/sayouzone/solar-thermal/workspace/output
 ```
 

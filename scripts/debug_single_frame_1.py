@@ -52,10 +52,12 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s",
                     datefmt="%H:%M:%S")
 logger = logging.getLogger("debug_single_frame")
+_USE_BA = [False]
 
 # 프로젝트를 editable 설치하지 않았을 때를 위해 src 경로 추가.
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "label_studio"))
+
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
@@ -70,6 +72,14 @@ def main() -> int:
                    help="정사영상 GSD (m). 0 이면 자동")
     p.add_argument("--pair", action="store_true",
                    help="인접 두 장을 같은 좌표계에 겹쳐 저장 (스티칭 확인용)")
+    p.add_argument("--use-ba", type=Path, default=None,
+                   help="파이프라인이 저장한 cameras.npz 를 읽어 **BA 결과**로 "
+                        "워프한다. 지정하지 않으면 초기값(RTK+짐벌)을 쓴다. "
+                        "--measure 와 함께 쓰면 BA 전후 어긋남을 비교할 수 있다")
+    p.add_argument("--measure", action="store_true",
+                   help="인접 프레임 간 **지상 어긋남을 직접 측정**해 출력한다. "
+                        "정사보정된 두 장에서 SIFT 대응을 찾아 지리좌표 차이를 "
+                        "잰다. 이미지를 눈으로 보지 않고 숫자로 확인할 때 사용")
     p.add_argument("--epsg", type=int, default=5186)
     p.add_argument("--glob", default="*.JPG",
                    help="이미지 글로브 패턴 (기본 *.JPG)")
@@ -85,7 +95,7 @@ def main() -> int:
         from sayou.image.metadata import extract_metadata
         from sayou.homography.homography import (
             build_frame_homography, intrinsics_from_metadata, recommend_gsd)
-        from sayou.homography.homography import (
+        from sayou.homography.homography.homography import (
             GroundPlane)
         from sayou.homography.rtk import estimate_ground_z
         from sayou.homography.pipeline import (
@@ -104,6 +114,22 @@ def main() -> int:
 
     crs = CRSConverter(target_epsg=args.epsg)
     _, cams = _build_initial_state(metas, crs)
+
+    # ★ BA 결과가 있으면 그것으로 워프한다. 초기값과 나란히 재면
+    #   "BA 가 자세 오차를 실제로 잡았는가" 가 바로 나온다.
+    if args.use_ba:
+        try:
+            z = np.load(args.use_ba, allow_pickle=True)
+            ba = np.asarray(z["cams_opt"], dtype=np.float64)
+            if len(ba) == len(cams):
+                cams = ba
+                _USE_BA[0] = True
+                logger.info("BA 결과로 워프합니다 (%s)", args.use_ba.name)
+            else:
+                logger.warning("cameras.npz 의 프레임 수(%d)가 이미지 수(%d)와 "
+                               "달라 초기값을 씁니다", len(ba), len(cams))
+        except Exception as exc:
+            logger.warning("cameras.npz 를 읽지 못해 초기값을 씁니다: %s", exc)
     intr = [intrinsics_from_metadata(m) for m in metas]
 
     zs = [z for z in (estimate_ground_z(m) for m in metas) if z is not None]
@@ -183,6 +209,9 @@ def main() -> int:
             logger.info("저장: %s  (%s)", out.name,
                         Path(metas[idx].origin_path).name)
 
+    if args.measure:
+        _measure(sel, frames, metas, gsd, warp_one, cv2)
+
     logger.info("")
     logger.info("★ 판별 방법")
     logger.info("  한 장 안에서 패널 행이 곧게 이어지면 → 워프는 정상,")
@@ -190,6 +219,57 @@ def main() -> int:
     logger.info("  한 장 안에서 이미 찢어져 있으면 → 워프 문제이고,")
     logger.info("     기준면·기복을 봐야 합니다. 스티칭은 무관합니다.")
     return 0
+
+
+def _measure(sel, frames, metas, gsd, warp_one, cv2):
+    """인접 프레임 간 지상 어긋남을 SIFT 대응으로 직접 잰다.
+
+    ★ 위상상관(phaseCorrelate)은 이 장면에서 신뢰도가 0.00~0.06 으로
+      의미가 없었다 (반복 격자라 상관 피크가 뭉개진다). SIFT 대응의
+      지리좌표 차이를 중앙값으로 보는 것이 확실하다.
+    """
+    sift = cv2.SIFT_create(nfeatures=6000)
+    bf = cv2.BFMatcher()
+    logger.info("")
+    logger.info("인접 프레임 간 지상 어긋남 (SIFT 대응 기준)")
+    meds = []
+    for a, b in zip(sel[:-1], sel[1:]):
+        wa, oa = warp_one(a)
+        wb, ob = warp_one(b)
+        if wa is None or wb is None:
+            continue
+        ga = cv2.cvtColor(wa, cv2.COLOR_RGB2GRAY) if wa.ndim == 3 else wa
+        gb = cv2.cvtColor(wb, cv2.COLOR_RGB2GRAY) if wb.ndim == 3 else wb
+        sc = 0.35
+        gas = cv2.resize(ga, None, fx=sc, fy=sc)
+        gbs = cv2.resize(gb, None, fx=sc, fy=sc)
+        k1, d1 = sift.detectAndCompute(gas, None)
+        k2, d2 = sift.detectAndCompute(gbs, None)
+        if d1 is None or d2 is None:
+            continue
+        m = bf.knnMatch(d1, d2, k=2)
+        good = [x for x, y in m if x.distance < 0.7 * y.distance]
+        if len(good) < 20:
+            logger.info("  %d-%d: 대응 부족 (%d개)", a, b, len(good))
+            continue
+        src = np.float32([k1[x.queryIdx].pt for x in good]) / sc
+        dst = np.float32([k2[x.trainIdx].pt for x in good]) / sc
+        gx1 = oa[0] + src[:, 0] * gsd; gy1 = oa[1] - src[:, 1] * gsd
+        gx2 = ob[0] + dst[:, 0] * gsd; gy2 = ob[1] - dst[:, 1] * gsd
+        d = np.hypot(gx2 - gx1, gy2 - gy1)
+        meds.append(float(np.median(d)))
+        logger.info("  %d-%d: 대응 %d개, 어긋남 중앙값 %.3f m, p90 %.3f m",
+                    a, b, len(good), np.median(d), np.percentile(d, 90))
+    if meds:
+        med = float(np.median(meds))
+        logger.info("  → 전체 중앙값 %.3f m", med)
+        logger.info("")
+        logger.info("  기준: %s",
+                    "BA 결과" if _USE_BA[0] else "BA 이전 초기값(RTK+짐벌)")
+        logger.info("  지상 %.2f m 는 자세 오차 약 %.2f° 에 해당합니다.",
+                    med, np.degrees(np.arctan(med / 48.0)))
+        logger.info("  최종 모자이크가 이보다 나쁘면 BA 가 이 오차를 "
+                    "못 잡고 있는 것입니다.")
 
 
 def _save(path, arr, origin, gsd, epsg, rasterio, from_origin):

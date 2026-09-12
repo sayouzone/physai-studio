@@ -813,7 +813,37 @@ def mosaic_frames(frames: list[FrameHomography],
 
     bounds, outliers = _robust_bounds(frames)
     if bounds is None:
-        raise ValueError("모든 프레임의 footprint 계산 실패")
+        # ★ 왜 실패했는지 알려준다. 이 메시지만 보고는 원인을 알 수 없어
+        #   두 번이나 헛돌았다 (실제로는 입력 이미지의 메타데이터 문제였다).
+        _n = len(frames)
+        _fb = [f.footprint_bounds() for f in frames[:20]]
+        _bad = sum(1 for b in _fb if b is None)
+        _cam = np.array([f.camera_xyz for f in frames[:20]], dtype=np.float64)
+        _finite = int(np.isfinite(_cam).all(axis=1).sum())
+        msg = [
+            f"모든 프레임의 footprint 계산 실패 (프레임 {_n}개)",
+            "",
+            f"  앞 20개 중 footprint 가 None: {_bad}개",
+            f"  카메라 좌표가 유한한 프레임: {_finite}/20",
+        ]
+        if _finite:
+            _f = _cam[np.isfinite(_cam).all(axis=1)]
+            msg.append(f"  카메라 X 범위: {_f[:, 0].min():.1f} ~ "
+                       f"{_f[:, 0].max():.1f}")
+            msg.append(f"  카메라 Y 범위: {_f[:, 1].min():.1f} ~ "
+                       f"{_f[:, 1].max():.1f}")
+            msg.append(f"  카메라 Z 범위: {_f[:, 2].min():.1f} ~ "
+                       f"{_f[:, 2].max():.1f}")
+        msg += [
+            "",
+            "  흔한 원인:",
+            "   - 입력 이미지에 EXIF/XMP 가 없음 (RTK·짐벌을 못 읽음).",
+            "     전처리로 만든 이미지를 쓰는 경우 특히 흔합니다 —",
+            "     원본과 카메라 Z 범위를 비교해 보세요.",
+            "   - 카메라가 기준면 아래에 있음 (기준면 Z 가 비정상).",
+            "   - 짐벌 자세가 비정상이라 광선이 지면과 만나지 않음.",
+        ]
+        raise ValueError("\n".join(msg))
     x_min, y_min, x_max, y_max = bounds
     if outliers:
         logger.warning(

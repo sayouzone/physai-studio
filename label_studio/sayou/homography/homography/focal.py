@@ -81,6 +81,11 @@ def metadata_camera_height(meta) -> float | None:
     if alt is not None and tgt is not None and np.isfinite(tgt) and tgt != 0:
         lrf = float(alt) - float(tgt)
 
+    # [sayou-patch] LRF 가 있으면 그것만 쓴다. RelativeAltitude 와 평균내면
+    #   지형 정보가 없는 값이 절반 섞여 기준이 통째로 편향된다.
+    if lrf is not None and 1.0 < lrf < 1000.0:
+        return float(lrf)
+
     vals = [v for v in (rel, lrf) if v is not None and 1.0 < v < 1000.0]
     if not vals:
         return None

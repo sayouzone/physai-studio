@@ -467,7 +467,6 @@ def run_homography_pipeline(image_dir: Path,
     ba_rmse = None
     obs_stats = None
     obs_cnt_final = None
-    obs_export = None            # [sayou-patch] 프레임 조건수 진단용
     focal_info = None
     terrain_info = None
     match_check_info = None
@@ -993,17 +992,6 @@ def run_homography_pipeline(image_dir: Path,
                                 "(게이트 %.0f px) — 정밀 단계로 바로 가면 "
                                 "점을 전부 잃습니다.", loose_px)
                 obs_cnt_final = obs_cnt.copy()
-                # [sayou-patch] 관측 영상좌표를 남긴다. 개수만으로는 구경문제
-                #   (도로 위 프레임의 대응이 한 직선에만 몰리는 것) 를 볼 수
-                #   없다. frame_conditioning.py 가 이걸 읽는다.
-                try:
-                    obs_export = (
-                        np.fromiter((o[0] for o in observations),
-                                    dtype=np.int64, count=len(observations)),
-                        np.asarray([o[2] for o in observations],
-                                   dtype=np.float32))
-                except Exception:
-                    obs_export = None
                 obs_stats = {
                     "median": float(np.median(obs_cnt)),
                     "min": float(obs_cnt.min()),
@@ -1102,17 +1090,10 @@ def run_homography_pipeline(image_dir: Path,
                 logger.info("자세 스무딩 생략 — 관측 수 정보가 없습니다 "
                             "(skip_sfm 이거나 BA 를 안 돌린 경우)")
                 raise RuntimeError("no_obs_counts")
-            # [sayou-patch] 앵커 적격성 판단용 초기 자세를 함께 넘긴다.
-            import os as _os
-            _anchor_deg = float(_os.environ.get("SAYOU_ANCHOR_ANGLE_DEG", 30.0))
-            _R_ref = [_rotation_from_opk(*initial_cameras[_i, 3:6])
-                      for _i in range(len(metas))]
             _R_all, _smooth_info = smooth_weak_attitudes(
                 _R_all, obs_cnt_final,
                 min_obs=attitude_smooth_min_obs,
-                max_gap=attitude_smooth_max_gap,
-                ref_rotations=_R_ref,
-                max_anchor_angle_deg=_anchor_deg)
+                max_gap=attitude_smooth_max_gap)
             attitude_smooth_info = _smooth_info
         except RuntimeError:
             pass
@@ -1122,16 +1103,6 @@ def run_homography_pipeline(image_dir: Path,
     # ★ 원본 인덱스를 함께 보관한다. 아래에서 관측 수(metas 기준)로
     #   프레임을 거를 때, frames 는 여기서 일부 제외될 수 있어 위치만으로
     #   맞추면 **엉뚱한 프레임을 지운다.**
-    # [sayou-patch] 스무딩까지 반영된 자세를 따로 남긴다.
-    try:
-        _sm = np.asarray(cams_opt, dtype=np.float64).copy()
-        for _i, _R in enumerate(_R_all):
-            if _i < len(_sm):
-                _sm[_i, 3:6] = _opk_from_rotation(_R)
-        cams_smoothed = _sm
-    except Exception:
-        cams_smoothed = None
-
     frames, frame_metas, frame_src_idx = [], [], []
     for i, (m, k) in enumerate(zip(metas, intrinsics_obj)):
         C = cams_opt[i, :3]
@@ -1157,11 +1128,6 @@ def run_homography_pipeline(image_dir: Path,
     #   덧씌울 이유가 없다. 실데이터에서 보정이 기준면을 8.2 m 아래로 밀어
     #   패널이 기준면보다 8.75 m 위에 놓였고, 시임 단차가 1.75 m 로 커졌다.
     #   (BA 를 고쳐 얻은 이득을 그대로 까먹었다.)
-    if auto_plane and plane_source == "override":
-        # [sayou-patch] 계수를 직접 지정했으면 그대로 쓴다.
-        logger.info("기준면 자동보정 생략 — 계수를 직접 지정했습니다.")
-        auto_plane = False
-
     if auto_plane and plane_source == "ba_points":
         logger.info("기준면 자동보정 생략 — BA 점군 평면을 신뢰합니다.")
         auto_plane = False
@@ -1665,12 +1631,7 @@ def run_homography_pipeline(image_dir: Path,
             output_dir / "cameras.npz",
             cams_opt=np.asarray(cams_opt, dtype=np.float64),
             initial=np.asarray(initial_cameras, dtype=np.float64),
-            paths=np.array([str(m.origin_path) for m in metas]),
-            # [sayou-patch]
-            **({} if obs_export is None else
-               {"obs_cam": obs_export[0], "obs_uv": obs_export[1]}),
-            **({} if cams_smoothed is None else
-               {"cams_smoothed": cams_smoothed}))
+            paths=np.array([str(m.origin_path) for m in metas]))
         logger.info("카메라 해 저장: cameras.npz "
                     "(BA 전후 비교용 — debug_single_frame --use-ba)")
     except Exception as exc:
@@ -1710,22 +1671,6 @@ def _estimate_stripe_pitch_px(metas, n_sample: int = 3):
     return float(np.median(vals))
 
 
-def _opk_from_rotation(R):
-    """[sayou-patch] _rotation_from_opk 의 역변환 (omega, phi, kappa).
-
-    _rotation_from_opk 가 Rz(k) @ Ry(p) @ Rx(o) 순서를 쓰므로 그 역을 푼다.
-    짐벌 자세가 phi = ±90° 근처면 특이(gimbal lock)라 그때는 kappa=0 으로
-    두고 omega 에 몰아준다 — 회전행렬 자체는 보존된다.
-    """
-    R = np.asarray(R, dtype=np.float64)
-    phi = np.arcsin(np.clip(R[0, 2], -1.0, 1.0))
-    if abs(np.cos(phi)) < 1e-8:
-        return float(np.arctan2(-R[1, 2], R[1, 1])), float(phi), 0.0
-    omega = np.arctan2(-R[1, 2], R[2, 2])
-    kappa = np.arctan2(-R[0, 1], R[0, 0])
-    return float(omega), float(phi), float(kappa)
-
-
 def _rotation_from_opk(omega, phi, kappa):
     from .geometry import rotation_matrix
     return rotation_matrix(omega, phi, kappa)
@@ -1752,52 +1697,6 @@ def _resolve_ground_plane(metas, cams_opt, pts_opt, allow_tilted_plane=True,
     ``estimate_ground_z`` 가 ``None`` 을 주는 사진은 평면 추정 근거에서
     빠지되, 다른 사진이 근거를 주면 그 평면을 공유해서 계속 처리한다.
     """
-    # [sayou-patch] 계수를 직접 지정하면 추정을 건너뛴다.
-    import os as _os
-    _ov = _os.environ.get("SAYOU_PLANE_OVERRIDE", "").strip()
-    if _ov:
-        try:
-            _v = [float(t) for t in _ov.replace(" ", "").split(",")]
-            if len(_v) != 5:
-                raise ValueError("a,b,c,origin_x,origin_y 다섯 개가 필요합니다")
-            _pl = GroundPlane(a=_v[0], b=_v[1], c=_v[2],
-                              origin_xy=(_v[3], _v[4]))
-            logger.warning("기준면을 환경변수로 지정했습니다 — 추정을 "
-                           "건너뜁니다: a=%+.6f b=%+.6f c=%.3f 경사 %.3f°",
-                           _v[0], _v[1], _v[2],
-                           np.degrees(np.arctan(np.hypot(_v[0], _v[1]))))
-            # [sayou-patch] ★ 원점이 이 부지 카메라에서 멀면 **다른 부지의
-            #   값이 셸에 남아 새어 들어온 것**이다. 실측: 직전 부지 override
-            #   (원점 188450,279043)가 130 m 떨어진 다음 부지에 그대로
-            #   적용돼 기준면이 8.09 m 높아졌고, plane_sweep 이 -8.83 m 를
-            #   요구했다. 그 값을 진짜 기준면 오차로 착각해 세 번을 헛돌았다.
-            try:
-                _cams = np.asarray(cams_opt, dtype=float)
-                _cx = float(np.median(_cams[:, 0]))
-                _cy = float(np.median(_cams[:, 1]))
-                _d = float(np.hypot(_cx - _v[3], _cy - _v[4]))
-                _dz = _v[0] * (_cx - _v[3]) + _v[1] * (_cy - _v[4])
-                logger.warning("  원점에서 카메라 중심까지 %.0f m "
-                               "(경사로 인한 표고차 %+.2f m)", _d, _dz)
-                # 거리가 아니라 **표고차**로 판정한다. 실측 누출 사례는
-                # 175 m 로 거리 문턱(200 m)을 못 넘었지만 표고차가 8.09 m
-                # 였다. 피해는 표고차로 발생한다.
-                if abs(_dz) > 2.0:
-                    logger.error("  ★★ 지정한 원점이 이 부지 카메라 중심에서 "
-                                 "%.0f m 떨어져 있고, 경사 때문에 기준면이 "
-                                 "%+.2f m 어긋납니다.", _d, _dz)
-                    logger.error("     **다른 부지의 값이 셸에 남아 있지 "
-                                 "않은지 확인하십시오.**")
-                    logger.error("     이 부지 값이 아니라면: "
-                                 "unset SAYOU_PLANE_OVERRIDE")
-            except Exception:
-                pass
-            return _pl, "override", None
-        except Exception as _exc:
-            logger.error("SAYOU_PLANE_OVERRIDE 를 읽지 못했습니다 (%s): %s",
-                         _ov, _exc)
-            raise
-
     # LRF/메타데이터 기준 고도 — BA 점군 평면의 교차검증에 쓴다.
     ref_zs = [z for z in (estimate_ground_z(m) for m in metas) if z is not None]
     ref_z = float(np.median(ref_zs)) if ref_zs else None
