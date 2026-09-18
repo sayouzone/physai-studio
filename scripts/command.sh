@@ -685,15 +685,53 @@ export SAYOU_PLANE_OVERRIDE="<계산값>"
 python scripts/patch_sayou.py --root label_studio/sayou --revert
 python scripts/patch_sayou.py --root label_studio/sayou --only P1 P2 P3 P4 P5 P7 --apply
 
+### 실행
+
 python scripts/homography_pipeline.py \
   --image-dir $IMAGE_DIR/TM --output-dir $IMAGE_DIR/tm_plane \
   --offnadir-frac 0.32 --panel-unit 2 --smooth-weak-attitude
+
+
+unset SAYOU_PLANE_OVERRIDE
+export SAYOU_PLANE_OVERRIDE="0.011920129,-0.014532470,33.3872,290801.222,266963.667"
+
+python scripts/homography_pipeline.py \
+  --image-dir $IMAGE_DIR/TM --output-dir $IMAGE_DIR/tm_plane \
+  --offnadir-frac 0.32 --panel-unit 2 --smooth-weak-attitude
+
+export SAYOU_PLANE_OVERRIDE="0.011920129,-0.014532470,33.3872,290801.222,266963.667"
+
+python scripts/homography_pipeline.py \
+  --image-dir $IMAGE_DIR/TM --output-dir $IMAGE_DIR/tm_final \
+  --offnadir-frac 0.32 --panel-unit 2 --smooth-weak-attitude
+
+### 검증
+
+python scripts/plane_sweep.py --image-dir $IMAGE_DIR/TM \
+    --use-ba $IMAGE_DIR/tm_release/cameras.npz --summary $IMAGE_DIR/tm_release/summary.json \
+    --pitch-m 2.0 --count 6 --z-min -2 --z-max 12 \
+    --starts 30,60,90,120,150,180,210,240,270,300 2>&1 | tail -28
+
+
+unset SAYOU_PLANE_OVERRIDE
+python scripts/plane_sweep.py --image-dir $IMAGE_DIR/TM \
+    --use-ba $IMAGE_DIR/tm_plane/cameras.npz --summary $IMAGE_DIR/tm_plane/summary.json \
+    --pitch-m 2.0 --count 6 --z-min -3 --z-max 3 \
+    --starts 30,60,90,120,150,180,210,240,270,300 2>&1 | tail -24
+
+
+python scripts/qc_tear.py \
+    $IMAGE_DIR/tm_release/mosaic.tif $IMAGE_DIR/tm_plane/mosaic.tif \
+    --window --x 290725 --y 267050 --size 4000 4500 --block-m 12 --pitch-m 2.0
+
 
 # 갈평저수지
 
 IMAGE_DIR=~/Development/sayouzone/solar-thermal/data/solar/갈평저수지
 
 ## RGB
+
+### 부지 사전 진단
 
 exiftool -q -n -T -GPSLatitude -GPSLongitude -GPSAltitude \
     -RelativeAltitude -LRFTargetDistance $IMAGE_DIR/RGB/*.JPG > $IMAGE_DIR/exif.tsv
@@ -1143,3 +1181,188 @@ python scripts/homography_pipeline.py \
 
 python scripts/frame_conditioning.py $IMAGE_DIR/tm_release/cameras.npz \
   --out-dir $IMAGE_DIR/tm_release/cond
+
+
+# 극동대학교/극동대캠퍼스
+
+IMAGE_DIR=/Users/seongjungkim/Downloads/극동대학교/극동대캠퍼스/IV커브안됨/H20T
+
+exiftool -q -n -T -GPSLatitude -GPSLongitude -GPSAltitude \
+    -RelativeAltitude -LRFTargetDistance $IMAGE_DIR/RGB_Zoom/*.JPG > $IMAGE_DIR/exif_zoom.tsv
+
+python scripts/site_triage.py $IMAGE_DIR/exif_zoom.tsv
+
+exiftool -q -n -T -GPSLatitude -GPSLongitude -GPSAltitude \
+    -RelativeAltitude -LRFTargetDistance $IMAGE_DIR/RGB_Wide/*.JPG > $IMAGE_DIR/exif_wide.tsv
+
+python scripts/site_triage.py $IMAGE_DIR/exif_wide.tsv
+
+## RGB
+
+### 실행
+
+unset SAYOU_PLANE_OVERRIDE SAYOU_OFFNADIR_CEILING
+python scripts/patch_sayou.py --root label_studio/sayou --revert
+python scripts/patch_sayou.py --root label_studio/sayou --only P2 P3 P4 P5 P7 --apply
+
+python scripts/homography_pipeline.py \
+  --image-dir $IMAGE_DIR/RGB_Wide --output-dir $IMAGE_DIR/base \
+  --offnadir-frac 0.32 --panel-unit 2 --smooth-weak-attitude
+
+export SAYOU_PLANE_OVERRIDE="0.026183274,-0.016738483,138.0078,249341.056,479708.911"
+
+python scripts/homography_pipeline.py \
+  --image-dir $IMAGE_DIR/RGB_Wide --output-dir $IMAGE_DIR/roof \
+  --offnadir-frac 0.32 --panel-unit 2 --smooth-weak-attitude
+
+python -c "
+import numpy as np, shutil, pathlib
+IMG = pathlib.Path('$IMAGE_DIR/RGB_Wide')
+d = np.genfromtxt('$IMAGE_DIR/exif_wide.tsv', dtype=float)
+gz = d[:,2] - d[:,4]
+files = sorted(IMG.glob('*.JPG'))
+assert len(files) == len(d), f'{len(files)} vs {len(d)}'
+out = IMG.parent / 'RGB_Roof'; out.mkdir(exist_ok=True)
+n = 0
+for f, g in zip(files, gz):
+    if g > 131.0:
+        shutil.copy2(f, out / f.name); n += 1
+print(f'옥상 프레임 {n}장 → {out}')
+"
+
+unset SAYOU_PLANE_OVERRIDE
+export SAYOU_PLANE_OVERRIDE="0.026183274,-0.016738483,137.5078,249341.056,479708.911"
+
+python scripts/homography_pipeline.py \
+  --image-dir $IMAGE_DIR/RGB_Roof --output-dir $IMAGE_DIR/roof_only \
+  --offnadir-frac 0.32 --panel-unit 2 --smooth-weak-attitude
+
+### 검증
+
+unset SAYOU_PLANE_OVERRIDE
+python scripts/plane_sweep.py --image-dir $IMAGE_DIR/RGB_Wide \
+    --use-ba $IMAGE_DIR/roof/cameras.npz --summary $IMAGE_DIR/roof/summary.json \
+    --pitch-m 2.01 --count 6 --z-min -4 --z-max 4 \
+    --starts 8,20,32,44,56,68,80,92,104,116,128,140,152,164,176,190 2>&1 | tail -30
+
+gdal_translate -projwin 249314 479732 249368 479685 \
+    $IMAGE_DIR/roof/mosaic.tif $IMAGE_DIR/roof/mosaic_roof.tif
+
+python scripts/plane_sweep.py --image-dir $IMAGE_DIR/RGB_Wide \
+    --use-ba $IMAGE_DIR/roof/cameras.npz --summary $IMAGE_DIR/roof/summary.json \
+    --pitch-m 2.01 --count 6 --z-min -14 --z-max 2 \
+    --starts 8,20,32,44,56,68,80,92,104,116,128,140,152,164,176,190 2>&1 | tail -30
+
+python -c "
+import json;s=json.load(open('$IMAGE_DIR/roof/summary.json'));o=s['ortho'];q=o['quality']
+print('평면', s['plane_source'], s['ground_plane']['c'])
+print('GSD %.4f  eff %.4f' % (s['gsd_m'], q['eff_gsd_m']))
+print('misalign %.3f / p90 %.3f  파손 %.1f%%  블록 %d'
+      % (q['panel_misalign_median_m'], q['panel_misalign_p90_m'],
+         100*q['broken_block_ratio'], q['blocks']))
+print('충전율 %.1f%%  부지내 %.1f%%  연직완화 %.1f%%'
+      % (100*q['valid_ratio'], 100*q['coverage_in_site'], 100*o['offnadir_fallback_ratio']))
+print('관측', s['observations_per_frame'])
+print('초점', s['focal_calibration'].get('d_metadata_median_m'),
+      s['focal_calibration'].get('final_check'))
+"
+
+python  -c "
+import numpy as np
+d = np.genfromtxt('$IMAGE_DIR/exif_zoom.tsv', dtype=float)
+gz = d[:,2] - d[:,4]
+idx = np.flatnonzero(gz > 131.0)
+# 연속 구간으로 묶어 --starts 후보를 만든다
+runs, cur = [], [idx[0]]
+for i in idx[1:]:
+    if i - cur[-1] <= 2: cur.append(i)
+    else: runs.append(cur); cur = [i]
+runs.append(cur)
+runs = [r for r in runs if len(r) >= 8]
+print('옥상 프레임 %d장, 8장 이상 연속 구간 %d개' % (len(idx), len(runs)))
+print('--starts ' + ','.join(str(r[0]) for r in runs))
+"
+
+python -c "
+import numpy as np
+d = np.genfromtxt('$IMAGE_DIR/exif_zoom.tsv', dtype=float)
+import json
+z = np.load('$IMAGE_DIR/zoom/cameras.npz', allow_pickle=True)['cams_opt']
+gz = d[:,2] - d[:,4]
+hi = gz > 131.0
+X = z[:,0]
+for lab, sel in [('서쪽 X<249341', hi & (X < 249341)),
+                 ('동쪽 X>=249341', hi & (X >= 249341))]:
+    g = gz[sel]
+    if sel.sum():
+        print('%s  %3d장  표고 %.1f ~ %.1f m  중앙값 %.2f  표준편차 %.2f'
+              % (lab, sel.sum(), g.min(), g.max(), np.median(g), g.std()))
+"
+
+
+
+# 그린환경센터
+
+IMAGE_DIR=~/Development/sayouzone/solar-thermal/data/solar/그린환경센터
+
+## TM
+
+exiftool -q -n -T -GPSLatitude -GPSLongitude -GPSAltitude \
+    -RelativeAltitude -LRFTargetDistance \
+    -FocalLengthIn35mmFormat -ImageWidth $IMAGE_DIR/TM/*.JPG > $IMAGE_DIR/exif_tm.tsv
+
+awk 'NR==1{print NF" 열 (7이어야 함)"}' $IMAGE_DIR/exif_tm.tsv
+
+python scripts/patch_sayou.py --root label_studio/sayou --revert
+python scripts/patch_sayou.py --root label_studio/sayou --only P1 P2 P3 P4 P5 P7 --apply
+
+python scripts/homography_pipeline.py \
+  --image-dir $IMAGE_DIR/TM --output-dir $IMAGE_DIR/tm_base \
+  --offnadir-frac 0.32 --panel-unit 2 --smooth-weak-attitude
+
+export SAYOU_PLANE_OVERRIDE="0.017622275,0.002623739,115.7860,192856.100,235020.500"
+
+python scripts/homography_pipeline.py \
+  --image-dir $IMAGE_DIR/TM --output-dir $IMAGE_DIR/tm_plane \
+  --offnadir-frac 0.32 --panel-unit 2 --smooth-weak-attitude
+
+export SAYOU_PLANE_OVERRIDE="0.017622275,0.002623739,115.7860,192856.100,235020.500"
+
+python scripts/homography_pipeline.py \
+  --image-dir $IMAGE_DIR/TM --output-dir $IMAGE_DIR/tm_release \
+  --offnadir-frac 0.32 --panel-unit 2 --smooth-weak-attitude
+
+gdal_translate -projwin 192794 235060 192921 234986 \
+    $IMAGE_DIR/tm_release/mosaic.tif $IMAGE_DIR/tm_release/mosaic_core.tif
+
+
+python -c "
+import json;s=json.load(open('$IMAGE_DIR/tm_base/summary.json'));o=s['ortho'];q=o['quality']
+print('평면 %s  c=%.2f  경사 %.3f도' % (s['plane_source'], s['ground_plane']['c'], s['ground_plane']['slope_deg']))
+print('경사검사', s.get('plane_tilt_check'))
+print('초점 d_metadata %.3f  잔차 %s' % (s['focal_calibration']['d_metadata_median_m'],
+      s['focal_calibration'].get('final_check',{}).get('residual')))
+print('GSD %.4f  eff %.4f' % (s['gsd_m'], q['eff_gsd_m']))
+print('패널 단위 %.3f m' % o['panel_unit_info']['unit_m'])
+print('매칭 내부 %.1f%% / 교차 %.1f%%' % (100*s['match_diagnosis']['same_line_rate'],
+      100*s['match_diagnosis']['cross_line_rate']))
+print('관측', s['observations_per_frame'])
+print('misalign %.3f / p90 %.3f  파손 %.1f%%  블록 %d'
+      % (q['panel_misalign_median_m'], q['panel_misalign_p90_m'],
+         100*q['broken_block_ratio'], q['blocks']))
+print('표면 %s  충전율 %.1f%%  연직완화 %.1f%%'
+      % (s.get('surface_model'), 100*q['valid_ratio'], 100*o['offnadir_fallback_ratio']))
+"
+
+PITCH=$(python -c "import json;print(round(json.load(open('$IMAGE_DIR/tm_base/summary.json'))['ortho']['panel_unit_info']['unit_m'],2))")
+echo "PITCH=$PITCH"
+
+python scripts/plane_sweep.py --image-dir $IMAGE_DIR/TM \
+    --use-ba $IMAGE_DIR/tm_base/cameras.npz --summary $IMAGE_DIR/tm_base/summary.json \
+    --pitch-m $PITCH --count 6 --z-min -8 --z-max 8 \
+    --starts 30,60,90,120,150,180,210,240,270,300 2>&1 | tail -30
+
+
+python scripts/qc_tear.py $IMAGE_DIR/tm_release/mosaic_core.tif \
+    --window --x 192795 --y 235055 --size 3300 2000 --block-m 12 --pitch-m 2.0
+

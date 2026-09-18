@@ -74,6 +74,30 @@ def load_npz(cam_path, alt_path):
             float("nan"), float("nan"), 7)
 
 
+def _detect_two_level(z, min_gap=3.0, min_frac=0.15):
+    """지면 표고가 두 덩어리로 갈리는지 본다 (옥상·계단식 조성).
+
+    가장 큰 빈 구간(gap)이 min_gap 이상이고 양쪽에 각각 min_frac 이상이
+    있으면 두 층으로 본다.
+    """
+    v = np.sort(np.asarray(z, dtype=float))
+    if len(v) < 30:
+        return None
+    d = np.diff(v)
+    i = int(np.argmax(d))
+    gap = float(d[i])
+    lo_n, hi_n = i + 1, len(v) - i - 1
+    if gap < min_gap or min(lo_n, hi_n) < min_frac * len(v):
+        return None
+    lo_med = float(np.median(v[:i + 1]))
+    hi_med = float(np.median(v[i + 1:]))
+    # gap = 값이 하나도 없는 구간의 폭, step = 두 층 중앙값의 차이.
+    # 안내에 써야 하는 것은 step 이다 (실측에서 gap 5.4 vs step 14.2 m).
+    return dict(gap=gap, step=hi_med - lo_med,
+                cut=float(0.5 * (v[i] + v[i + 1])),
+                lo_med=lo_med, hi_med=hi_med, lo_n=lo_n, hi_n=hi_n, n=len(v))
+
+
 def fit_plane_trimmed(x, y, z, ok):
     """대칭 절단 최소제곱 — 법면·수목 이상치를 걷어낸다."""
     ox, oy = float(np.mean(x)), float(np.mean(y))
@@ -306,7 +330,15 @@ def main():
     if ok.sum() < 20:
         print("   LRF 유효 %d장뿐 — 판정 불가" % ok.sum())
         rmse = relief = float("nan")
+        two_level = None
     else:
+        # ★ 계단/옥상 부지: 지면이 **연속 경사**가 아니라 **두 층**일 수 있다.
+        #   실측(옥상 부지): 옥상 137.6 m 97장 + 주변 지면 123.4 m 102장,
+        #   높이차 14.2 m. 전부 한 평면으로 적합하면 두 층 사이를 대각선으로
+        #   가로질러 **경사 24.1도, RMSE 4.85 m** 라는 존재하지 않는 값이
+        #   나온다. 각 층을 따로 적합하면 1.8도/1.22 m 와 2.6도/1.59 m 다.
+        #   처방이 정반대(경사 보정 vs 한 층만 기준면으로)라 반드시 가른다.
+        two_level = _detect_two_level(gz[ok])
         _, _, slope, rmse, m = fit_plane_trimmed(x, y, gz, ok)
         relief = float(np.percentile(gz[ok], 97) - np.percentile(gz[ok], 3))
         print("   LRF 지면 표고 %.1f ~ %.1f m (p3~p97),  기복 %.1f m"
@@ -315,7 +347,27 @@ def main():
         print("   평면적합 경사 %.3f도,  RMSE %.2f m (inlier %d/%d)   %s"
               % (slope, rmse, m.sum(), ok.sum(),
                  bar(rmse, REF["lrf_rmse"], True)))
-        if rmse > 1.5:
+        if two_level:
+            t = two_level
+            print()
+            print("   ★★ 지면이 **두 층**으로 갈립니다 — 연속 경사가 아닙니다.")
+            print("      아래층 %.1f m (%d장)  |  위층 %.1f m (%d장)"
+                  % (t["lo_med"], t["lo_n"], t["hi_med"], t["hi_n"]))
+            print("      층 높이차 %.1f m  (그 사이 %.1f m 구간에는 지면이 "
+                  "전혀 없음)" % (t["step"], t["gap"]))
+            for nm2, sel in (("아래층", gz <= t["cut"]), ("위층", gz > t["cut"])):
+                m2 = ok & sel
+                if m2.sum() >= 10:
+                    _, _, sl2, rm2, _ = fit_plane_trimmed(x, y, gz, m2)
+                    print("      %s만 따로 적합: 경사 %.2f도, RMSE %.2f m"
+                          % (nm2, sl2, rm2))
+            print()
+            print("      → 위 '경사 %.3f도 / RMSE %.2f m' 는 두 층 사이를"
+                  % (slope, rmse))
+            print("        가로지른 **허수입니다.** 경사 보정을 하지 마십시오.")
+            print("      → 패널이 있는 층 하나를 기준면으로 잡으십시오.")
+            print("        (옥상 설치면 위층. P5 override 로 그 층의 평면 지정)")
+        elif rmse > 1.5:
             print("   ★ RMSE 가 1.5 m 를 넘습니다 — 단일 평면 모델이 "
                   "성립하지 않습니다. 기준면을 어떻게 잡아도 이만큼 남습니다.")
         elif rmse < 0.5:
@@ -358,7 +410,10 @@ def main():
         shoot.append("궤적 안 최소 k %.3f (기준 0.09, 한계 0.12)" % med_k)
     if np.isfinite(dens) and dens < 9.0:
         shoot.append("촬영 밀도 %.1f (기준 12.5, 한계 9.0)" % dens)
-    if np.isfinite(rmse) and rmse > 1.5:
+    if two_level:
+        terrain.append("지면이 두 층 (높이차 %.1f m) — 한 층만 기준면으로"
+                       % two_level["step"])
+    elif np.isfinite(rmse) and rmse > 1.5:
         terrain.append("LRF 평면 RMSE %.2f m (한계 1.5)" % rmse)
     fails = shoot + terrain
     crop = bool(f_px) and np.isfinite(frac_out) and frac_out > 0.35
@@ -395,6 +450,13 @@ def main():
         for f in terrain:
             print("   - " + f)
         print()
+        if two_level:
+            print("  **경사 보정을 하지 마십시오.** 이 부지는 기울어진 것이")
+            print("  아니라 두 층으로 나뉜 것입니다. 패널이 있는 층(옥상이면")
+            print("  위층)의 평면만 P5 override 로 지정하십시오.")
+            print("  다른 층은 모자이크에서 잘라내는 편이 낫습니다.")
+            print("=" * 68)
+            return
         print("  기본 설정을 쓰지 마십시오 — **경사 보정이 실제로 듣습니다.**")
         print("  실측(경사 21도 산지): 평면 0도 → 13.6도 로 어긋남")
         print("  0.392 → 0.265 m (32%). 다만 잔차는 남습니다.")

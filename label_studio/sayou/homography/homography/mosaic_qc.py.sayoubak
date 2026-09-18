@@ -53,9 +53,9 @@ __all__ = ["assess_mosaic"]
 
 
 def assess_mosaic(path, gsd_m: float, *,
-                  block_m: float = 12.5,      # [sayou-patch] 3.8 -> 12.5
-                  min_panel_frac: float = 0.25,   # [sayou-patch] 0.30 -> 0.25
-                  max_shift_m: float = 4.00,  # [sayou-patch] 1.00 -> 4.00
+                  block_m: float = 3.8,
+                  min_panel_frac: float = 0.30,
+                  max_shift_m: float = 1.00,
                   read_px: int = 12000,
                   relief_m: float | None = None,
                   max_blocks: int = 4000) -> dict | None:

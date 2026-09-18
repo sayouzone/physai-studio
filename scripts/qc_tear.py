@@ -48,6 +48,9 @@ import cv2
 import numpy as np
 
 
+_last_angle = [0.0]
+
+
 def read_window(path, X, Y, w, h):
     import rasterio
     from rasterio.windows import Window
@@ -65,6 +68,48 @@ def read_window(path, X, Y, w, h):
         a = np.transpose(ds.read(indexes=[1, 2, 3],
                                  window=Window(x, y, w, h)), (1, 2, 0))
     return a, g
+
+
+def detect_grid_angle(a, gsd):
+    """패널 격자가 영상 축에서 몇 도 돌아가 있는지 FFT 로 잰다.
+
+    ★ 옥상 부지 실측: 건물이 비스듬히 앉아 격자가 36도 돌아가 있었다.
+      행 프로파일을 영상 가로로 평균내면 그 구조가 뭉개져 상호상관이
+      엉뚱한 곳에 붙는다. 같은 모자이크를 0도로 재면 57.6%, 격자
+      방향으로 돌려 재면 전혀 다른 값이 나온다.
+    """
+    n = min(a.shape[0], a.shape[1], 2048)
+    y0 = (a.shape[0] - n) // 2
+    x0 = (a.shape[1] - n) // 2
+    g = cv2.cvtColor(a[y0:y0 + n, x0:x0 + n], cv2.COLOR_RGB2GRAY).astype(np.float32)
+    if not np.isfinite(g).all() or g.std() < 1e-3:
+        return 0.0
+    g = g - g.mean()
+    g *= np.outer(np.hanning(n), np.hanning(n))
+    F = np.abs(np.fft.fftshift(np.fft.fft2(g)))
+    c = n // 2
+    yy, xx = np.mgrid[:n, :n]
+    r = np.hypot(yy - c, xx - c)
+    th = np.degrees(np.arctan2(yy - c, xx - c)) % 180
+    band = (r > 20) & (r < n * 0.25)
+    prof = np.array([F[band & (np.abs(th - t) < 1.0)].sum()
+                     for t in range(180)])
+    if prof.max() <= 0:
+        return 0.0
+    best = float(np.argmax(prof))
+    # 0~90 으로 접는다 (직교 격자라 90도 차이는 같은 방향)
+    return best - 90.0 if best > 45.0 and best <= 135.0 else (
+        best - 180.0 if best > 135.0 else best)
+
+
+def rotate_keep(a, deg):
+    """중심 기준 회전. 빈 자리는 0 (유효 마스크가 알아서 걸러낸다)."""
+    if abs(deg) < 0.5:
+        return a
+    h, w = a.shape[:2]
+    Mrot = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), deg, 1.0)
+    return cv2.warpAffine(a, Mrot, (w, h), flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
 
 def panel_mask(a):
@@ -185,10 +230,16 @@ def _stats(d, tried, g):
                 p99=float(np.percentile(d, 99)), mx=float(d.max()))
 
 
-def measure(path, X, Y, w, h, pitch_m, strip_m, block_m, min_corr):
+def measure(path, X, Y, w, h, pitch_m, strip_m, block_m, min_corr,
+            angle_deg=None):
     a, g = read_window(path, X, Y, w, h)
     if a is None:
         return None
+    if angle_deg is None:
+        angle_deg = detect_grid_angle(a, g)
+    if abs(angle_deg) >= 0.5:
+        a = rotate_keep(a, angle_deg)
+    _last_angle[0] = float(angle_deg)
     gray = cv2.cvtColor(a, cv2.COLOR_RGB2GRAY).astype(np.float32)
     valid = a.sum(2) > 0
     if valid.mean() < 0.2:
@@ -233,6 +284,10 @@ def main() -> int:
                     help="패널뿐 아니라 수목·법면까지 전부 잰다. 기본은 "
                          "패널 영역만 — 법면은 어떤 설정으로도 안 고쳐져서 "
                          "함께 재면 패널의 차이가 묻힌다")
+    ap.add_argument("--angle-deg", type=float, default=None,
+                    help="패널 격자가 영상 축에서 기울어진 각도. 생략하면 "
+                         "FFT 로 자동 검출한다. 0 을 주면 회전하지 않는다 "
+                         "(--window 모드에서만 동작)")
     ap.add_argument("--window", action="store_true",
                     help="--x/--y 창 하나만 잰다 (빠르지만 지점이 적어 "
                          "0.5%%p 미만 차이는 구분되지 않는다). 기본은 "
@@ -246,7 +301,10 @@ def main() -> int:
             continue
         if a.window:
             r = measure(p, a.x, a.y, a.size[0], a.size[1],
-                        a.pitch_m, a.strip_m, a.block_m, a.min_corr)
+                        a.pitch_m, a.strip_m, a.block_m, a.min_corr,
+                        angle_deg=a.angle_deg)
+            if r is not None:
+                r["angle"] = _last_angle[0]
         else:
             r = measure_full(p, a.pitch_m, a.strip_m, a.block_m,
                              a.min_corr, panel_only=not a.all_area,
@@ -255,15 +313,35 @@ def main() -> int:
             print(f"  잴 수 있는 지점이 부족합니다: {p}")
             continue
         r["name"] = p.parent.name or p.stem
+        r["path"] = p
         rows.append(r)
     if not rows:
         return 2
+
+    # ★ 이름이 겹치면 어느 행이 어느 파일인지 알 수 없다. 실측: 두 파일을
+    #   모두 /tmp 에 두고 비교했더니 둘 다 "tmp" 로 찍혀 판정이 불가능했다.
+    #   겹치는 이름은 파일명(stem)으로, 그것도 겹치면 부모/파일명으로 바꾼다.
+    seen = {}
+    for r in rows:
+        seen.setdefault(r["name"], []).append(r)
+    for nm, grp in seen.items():
+        if len(grp) < 2:
+            continue
+        for r in grp:
+            r["name"] = r["path"].stem
+        if len({r["name"] for r in grp}) < len(grp):
+            for r in grp:
+                r["name"] = f'{r["path"].parent.name}/{r["path"].stem}'
 
     w = max(len(r["name"]) for r in rows)
     print(f"  {'run':<{w}} {'지점':>9} {'유효':>7} {'>0.5m':>8}"
           f" {'95% 구간':>16} {'>1.0m':>8} {'p99':>7}")
     print("  " + "-" * (w + 60))
     rows = sorted(rows, key=lambda x: x["o05"])
+    ang = [r.get("angle") for r in rows if r.get("angle") is not None]
+    if ang and max(abs(v) for v in ang) >= 0.5:
+        print("  ※ 패널 격자가 영상 축에서 %.0f도 기울어져 있어 그만큼 "
+              "회전해 쟀습니다." % np.median(ang))
     for r in rows:
         print(f"  {r['name']:<{w}} {r['n']:9d} {r['eff']*100:6.1f}%"
               f" {r['o05']*100:7.2f}%"
