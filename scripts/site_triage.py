@@ -33,8 +33,13 @@
 from __future__ import annotations
 
 import argparse
+import glob
+import os
+import re
+from datetime import datetime
 import sys
 
+import math
 import numpy as np
 
 # EWP-서오창IC-2 실측 기준값 (튜닝이 통했던 부지)
@@ -74,13 +79,25 @@ def load_npz(cam_path, alt_path):
             float("nan"), float("nan"), 7)
 
 
-def _detect_two_level(z, min_gap=3.0, min_frac=0.15):
+def _detect_two_level(z, min_gap=3.0, min_frac=0.15, sep_ratio=1.5):
     """지면 표고가 두 덩어리로 갈리는지 본다 (옥상·계단식 조성).
 
-    가장 큰 빈 구간(gap)이 min_gap 이상이고 양쪽에 각각 min_frac 이상이
-    있으면 두 층으로 본다.
+    가장 큰 빈 구간(gap)이 min_gap 이상이고, 양쪽에 각각 min_frac 이상이
+    있고, **간극이 각 층 내부 산포보다 충분히 커야** 두 층으로 본다.
+
+    ★ 세 번째 조건이 없어서 경사면을 옥상으로 오진했다. 실측(같은 부지
+      두 회차): 표고가 88→115 m 로 거의 연속인 경사면인데 중간에 빈
+      구간 하나(2.35 m)가 있어 "두 층, 위층 폭 4.1 m" 로 판정했고,
+      옥상 기준면(113.8 m)을 적용했더니 전체 평면보다 나을 게 없었다
+      (14.55 vs 13.76%, 구간 겹침). 진짜 옥상(199장)은 아래층 σ 1.65 m,
+      위층 σ 1.25 m 에 간극 5.4 m 로 뚜렷이 갈렸다.
+
+      판정: 간극 > sep_ratio × max(아래층 σ, 위층 σ)
+        진짜 옥상   5.4 > 1.5 × 1.65 = 2.5   → 두 층
+        경사면       2.4 > 1.5 × 5.9  = 8.8  → 두 층 아님
     """
     v = np.sort(np.asarray(z, dtype=float))
+    v = v[np.isfinite(v)]
     if len(v) < 30:
         return None
     d = np.diff(v)
@@ -89,13 +106,193 @@ def _detect_two_level(z, min_gap=3.0, min_frac=0.15):
     lo_n, hi_n = i + 1, len(v) - i - 1
     if gap < min_gap or min(lo_n, hi_n) < min_frac * len(v):
         return None
-    lo_med = float(np.median(v[:i + 1]))
-    hi_med = float(np.median(v[i + 1:]))
+    lo, hi = v[:i + 1], v[i + 1:]
+    lo_sd, hi_sd = float(np.std(lo)), float(np.std(hi))
+    if gap < sep_ratio * max(lo_sd, hi_sd):
+        return None      # 연속 분포 속의 작은 빈틈 — 경사면
+    lo_med, hi_med = float(np.median(lo)), float(np.median(hi))
     # gap = 값이 하나도 없는 구간의 폭, step = 두 층 중앙값의 차이.
-    # 안내에 써야 하는 것은 step 이다 (실측에서 gap 5.4 vs step 14.2 m).
     return dict(gap=gap, step=hi_med - lo_med,
                 cut=float(0.5 * (v[i] + v[i + 1])),
-                lo_med=lo_med, hi_med=hi_med, lo_n=lo_n, hi_n=hi_n, n=len(v))
+                lo_med=lo_med, hi_med=hi_med, lo_n=lo_n, hi_n=hi_n,
+                lo_sd=lo_sd, hi_sd=hi_sd, n=len(v))
+
+
+def _report_roof(x, y, gz, ok, t, frame_w, frame_h, edge_m=5.0):
+    """두 층 부지에서 위층(옥상)의 크기·가장자리 비율·프레임 적합도.
+
+    ★ 작은 옥상은 가장자리가 면적의 대부분을 차지한다. 가장자리 바로
+      바깥이 낙차(높이차)만큼 아래이고 기준면은 옥상 안쪽에서만 맞으므로,
+      가장자리 픽셀을 비스듬한 프레임이 채우면 벽면·난간·아래층이
+      옥상 기준면으로 투영되며 `낙차 × k` 만큼 밀린다. 실측:
+        극동대 옥상   34 x 27 m   가장자리 5 m 띠 ≈ 56%   낙차 14.2 m
+        (비교: Site-2 두 회차는 옥상이 아니라 연속 경사면이었다)
+
+    ★ 프레임이 옥상보다 크면 한 장의 대부분이 아래층이다. 같은 비행에서
+        광각 60x45 m  교차 매칭 29%, tie point 0개 55%
+        줌   30x22 m             52%,                23%
+        열화상 18x15 m           100%,                 0%   ← 옥상 안에 들어감
+      다만 이 매칭 차이가 시임 품질로 그대로 옮겨지지는 않았다(광각·줌
+      qc_tear 구분 안 됨). 매칭 지표만으로 카메라를 고르지 말 것.
+
+    ★ plane_sweep 을 **모든 프레임**으로 돌리면 특징이 많은 층(대개 지면)에
+      맞춘다. 실측: 열화상으로 옥상 기준면을 재니 12곳 중 9곳이 -6 m 범위
+      끝(아래층 쪽)에 붙었다.
+    ★ 그러나 **옥상 위 연속 9장**에서만 재면 옥상 기준면을 잴 수 있다.
+      극동대 실측: 열화상(프레임 18x15 m, 옥상 안에 들어감)으로 재니 신뢰
+      9곳이 LRF 옥상 평면보다 +3.8 m 위로 모였고(잔차 0.51 m), 두 후보를
+      다시 재 경사 1.58°·c 141.52 가 수렴(잔차 0.35 m)했다. 그 평면을 줌에
+      넣자 원래 해상도에서 패널 모듈선이 곧게 이어졌다. 한때 "LRF 옥상 평면을
+      쓰라"고 안내했는데, 그 평면은 패널 면보다 약 4 m 낮았다.
+    ★ 프레임이 옥상보다 큰 센서는 옥상 프레임만 골라도 지면이 섞여 측정이
+      성립하지 않는다(극동대 광각 11/12 · 줌 6/12 곳이 범위 끝, 기복비율
+      0.00). 프레임이 옥상 안에 드는 센서로 재고 그 평면을 옮긴다.
+    ★ 판정은 원래 해상도로 패널 위를 잘라 눈으로 한다. 옥상 창의 qc_tear 는
+      바닥·난간이 섞여, 패널이 맞고 난간이 밀린 결과를 구분하지 못했다
+      (10.21 대 11.89%, 구간 겹침).
+    """
+    hi = ok & (gz > t["cut"])
+    if hi.sum() < 5:
+        return
+    rx, ry = float(np.ptp(x[hi])), float(np.ptp(y[hi]))
+    ra = rx * ry
+    inner = max(rx - 2 * edge_m, 0.0) * max(ry - 2 * edge_m, 0.0)
+    edge_frac = 1.0 - inner / ra if ra > 0 else 1.0
+    print()
+    print("      위층(옥상) 궤적 %.0f x %.0f m,  가장자리 %.0f m 띠가 면적의 %.0f%%"
+          % (rx, ry, edge_m, 100 * edge_frac))
+    if edge_frac > 0.4:
+        print("      ★ 옥상이 작습니다 — 면적의 대부분이 가장자리입니다.")
+        print("        가장자리 바로 밖이 %.1f m 아래라 그 근처 시임이 가장"
+              % t["step"])
+        print("        나쁩니다(벽면·난간·아래층이 %.1f m × k 만큼 밀림)."
+              % t["step"])
+        print("        육안 품질은 옥상 안쪽만 보고 판단하고, 결과는")
+        print("        옥상 범위로 잘라내십시오.")
+    if frame_w:
+        print("      프레임 %.0f x %.0f m  vs  옥상 %.0f x %.0f m"
+              % (frame_w, frame_h, rx, ry))
+        if frame_w > rx or frame_h > ry:
+            cover = min(1.0, ra / (frame_w * frame_h))
+            print("        → 프레임이 옥상보다 큽니다. 한 장 중 옥상은 최대 %.0f%%."
+                  % (100 * cover))
+            print("          아래층이 함께 찍혀 매칭이 불리해집니다(시임 품질로")
+            print("          그대로 옮겨지지는 않았으니 매칭만으로 판단하지 말 것).")
+            print("          같은 비행에 더 좁은 화각(줌·열화상)이 있으면 그쪽으로")
+            print("          기준면을 재십시오(아래).")
+        else:
+            print("        → 프레임이 옥상 안에 들어갑니다.")
+    print()
+    fits = bool(frame_w) and frame_w <= rx and frame_h <= ry
+    # 옥상 위 연속 9장 — plane_sweep 은 시작 프레임부터 연속 8쌍을 쓴다
+    idx = np.arange(len(gz))
+    runs = [int(i) for i in idx[:-8] if hi[i:i + 9].all()]
+    pick = [runs[k] for k in np.linspace(0, len(runs) - 1, min(12, len(runs))).astype(int)] if runs else []
+    print()
+    print("      ★ 옥상 기준면은 **옥상 위 프레임만으로** plane_sweep 을 돌려 재십시오.")
+    print("        모든 프레임으로 재면 지면 쪽에 맞춥니다. LRF 옥상 평면은 출발점일")
+    print("        뿐입니다 — 극동대에서는 패널 면보다 약 4 m 낮았습니다.")
+    if frame_w:
+        if fits:
+            print("        → 이 센서는 프레임이 옥상 안에 들어가 **잴 수 있습니다.**")
+        else:
+            print("        → 이 센서는 프레임이 옥상보다 커서, 옥상 프레임만 골라도 지면이")
+            print("          섞여 측정이 성립하지 않습니다(극동대 광각·줌 실측). 같은 비행에서")
+            print("          프레임이 옥상 안에 드는 센서(대개 열화상)로 재고 그 평면을")
+            print("          이 센서에 옮기십시오. 세 센서는 순번이 같아 아래 목록을 그대로 씁니다.")
+    print("        옥상 위 연속 9장 구간 %d곳%s" % (len(runs), "" if len(pick) >= 5 else
+          " — ★ 5곳 미만이라 측정이 약합니다. 옥상 위 비행이 짧습니다."))
+    if pick:
+        print("          export ROOF_STARTS=%s" % ",".join(map(str, pick)))
+        print("        (TSV 행 순서 = 사진 파일명 순서일 때의 프레임 번호입니다)")
+    m = hi.copy()
+    if m.sum() >= 5:
+        coef, (ox, oy), sl, rm, mm = fit_plane_trimmed(x, y, gz, m)
+        print("        출발점: 위층 LRF 적합 경사 %.2f도, RMSE %.2f m (%d점)"
+              % (sl, rm, int(mm.sum())))
+        print("          (국소 좌표 근사 — override 는 cameras.npz 좌표로 다시 적합)")
+    print("        절차: LRF 옥상 평면으로 한 번 돌림 → sweep <실행> <폴더> -2 10 \"$ROOF_STARTS\"")
+    print("              → ovr → 두 후보를 돌려 다시 잼 → 수렴한 평면을 다른 센서에도")
+    print("        판정: 원래 해상도로 패널 위를 잘라 눈으로. 옥상 창 qc_tear 는 바닥·")
+    print("              난간이 섞여 판정에 쓸 수 없습니다.")
+
+
+def _report_raised(x, y, gz, ok, frame_w, frame_h, gap=12.0, min_frames=5, edge=15.0):
+    """경사지 위 옥상 — 땅 평면을 뺀 높이로 솟은 무리를 찾는다.
+
+    ★ Site-2-29696 · 29719: 경사 26 m 부지 위 건물 옥상의 패널이 땅 기준면보다
+      13~18 m 높았다. 절대 높이로는 경사면 높은 쪽 땅과 옥상이 섞여 두 층이 보이지
+      않았고(_detect_two_level 불통과), 땅 평면을 빼자 +12~+18 m 에 옥상 무리가
+      뚜렷했다. 땅 기준면으로 만든 결과는 옥상 패널이 조각났고, 옥상 기준면(+17 m)을
+      윤곽 안에만 덮자(session_tools overlay) 두 센서 모두 이어졌다.
+    ★ 촬영 경계에 걸친 옥상은 레이저가 지붕을 한두 번만 맞혀 무리가 되지 않고,
+      영상도 비스듬한 프레임에서만 온다 — 판독 제한으로 알린다.
+    """
+    coef, (ox, oy), sl, rm, m = fit_plane_trimmed(x, y, gz, ok)
+    r = gz - (coef[0] * (x - ox) + coef[1] * (y - oy) + coef[2])
+    rin = float(np.sqrt((r[m] ** 2).mean())) if m.any() else 0.0
+    thr = max(8.0, 4.0 * rin)
+    hi = np.where(ok & (r > thr))[0]
+    if len(hi) < 1:
+        return None
+    par = list(range(len(hi)))
+    def find(i):
+        while par[i] != i:
+            par[i] = par[par[i]]; i = par[i]
+        return i
+    for i in range(len(hi)):
+        for j in range(i + 1, len(hi)):
+            if np.hypot(x[hi[i]] - x[hi[j]], y[hi[i]] - y[hi[j]]) < gap:
+                par[find(i)] = find(j)
+    groups = {}
+    for i in range(len(hi)):
+        groups.setdefault(find(i), []).append(int(hi[i]))
+    groups = sorted(groups.values(), key=len, reverse=True)
+    xmin, xmax, ymin, ymax = x.min(), x.max(), y.min(), y.max()
+    print()
+    print("   ★ 땅 평면을 뺀 높이로 보면 **솟은 무리**가 있습니다 (땅 평면보다 %.0f m 넘게 높은 프레임 %d장)."
+          % (thr, len(hi)))
+    print("     경사지 위 건물 옥상일 수 있습니다 — 절대 높이로는 경사면 높은 쪽 땅과 섞여 두 층으로 보이지 않습니다.")
+    main = []
+    for k, g in enumerate(groups):
+        cx, cy = float(np.mean(x[g])), float(np.mean(y[g]))
+        dedge = min(cx - xmin, xmax - cx, cy - ymin, ymax - cy)
+        limited = len(g) < min_frames or dedge < edge
+        why = []
+        if len(g) < min_frames: why.append("레이저가 지붕을 %d번만 맞힘" % len(g))
+        if dedge < edge: why.append("촬영 경계에서 %.0f m" % dedge)
+        print("     무리 %d: %2d장, 땅 평면보다 %+.1f m (%+.1f ~ %+.1f), 궤적 %.0f x %.0f m%s"
+              % (k + 1, len(g), np.median(r[g]), r[g].min(), r[g].max(), np.ptp(x[g]), np.ptp(y[g]),
+                 ("  — ★ 판독 제한: " + ", ".join(why)) if limited else ""))
+        if not limited:
+            main.append(g)
+    if not main:
+        print("     → 모두 판독 제한입니다. 그 옥상 위를 지나는 비행을 더하는 것이 근본 대책입니다.")
+        return dict(thr=thr, groups=groups, main=[])
+    sel = np.zeros(len(gz), bool)
+    for g in main: sel[g] = True
+    for need in (9, 6, 5):
+        starts = [int(i) for i in range(len(gz) - need + 1) if sel[i:i + need].all()]
+        if len(starts) >= 5: break
+    pick = sorted(set(starts[int(round(i))] for i in np.linspace(0, len(starts) - 1, min(12, len(starts))))) if starts else []
+    dh = float(np.median(r[sel]))
+    print()
+    print("     → 땅 기준면은 옥상 패널에 맞지 않습니다(땅 평면보다 %+.0f m). 옥상은 따로 재서 덮으십시오." % dh)
+    print("       옥상 위 연속 %d장 구간 %d곳%s" % (need, len(starts), "" if len(pick) >= 5 else " — ★ 5곳 미만, 측정이 약합니다"))
+    if pick:
+        print("         export ROOF_STARTS=%s" % ",".join(map(str, pick)))
+    if frame_w and np.ptp(x[sel]) and (frame_w > np.ptp(x[sel]) + 2 * 5 or frame_h > np.ptp(y[sel]) + 2 * 5):
+        print("       프레임 %.0f x %.0f m 가 옥상보다 커서 한 장에 땅이 섞입니다. 기복비율이 낮아 '신뢰 낮음'이 많아도"
+              % (frame_w, frame_h))
+        print("       최적 높이가 여러 시작 번호에서 한곳에 모이면 그 값을 쓰고, 판정은 패널 타일로 하십시오(29696 실측).")
+    print("       절차: 땅 기준 실행 <R> 을 만든 뒤")
+    print("         sweep <R> <폴더> %.0f %.0f $ROOF_STARTS     # 땅 기준면에 더할 오프셋을 넓게 탐색"
+          % (max(2.0, dh - 10), dh + 8))
+    print("         piece <R>_roof <폴더> \"<땅 기준면에서 c 만 최적 오프셋만큼 올린 평면>\"")
+    print("         session_tools.py overlay --base <R>/mosaic.tif --top <R>_roof/mosaic.tif \\")
+    print("             --exif <이 TSV> --plane=\"<땅 기준면>\" --out <R>_2layer/mosaic.tif")
+    print("       다른 센서는 같은 옥상 평면과 같은 윤곽으로 합친 뒤 열화상에 정렬(session_tools align).")
+    return dict(thr=thr, groups=groups, main=main, dh=dh, starts=pick)
 
 
 def fit_plane_trimmed(x, y, z, ok):
@@ -159,9 +356,371 @@ def min_k_map(x, y, height, half_diag, cell=4.0):
                 n_cov=int(covered.sum()), hull_area=hull_area)
 
 
+def analyze_sessions(names, x, y):
+    """파일명(DJI_YYYYMMDDhhmmss_NNNN)으로 촬영 세션을 가르고 경계를 본다.
+
+    ★ 아홉 부지 중 네 곳(EWP · K_Demo · 그린환경 · 옥산)이 두 비행이었다.
+      EWP 는 배터리 교체 뒤 **정확히 다음 줄**에서 재개해, 경계 두 줄
+      (세션 0 마지막 Y 458899, 세션 1 첫 줄 458906, 간격 7.1 m = 평소 간격)이
+      각 블록의 가장자리가 됐다. 두 세션을 함께 풀면 경계 줄끼리 약 20분
+      차이라 대응이 약하고 노출 이득이 양쪽 clip 에 붙어 이음매가 조각났고,
+      세션 하나만 풀면 경계 줄이 가장자리라 기운 복제가 생겼다. 경계만
+      좁게 함께 풀었을 때만 깨끗했다.
+      K_Demo 는 열화상만 2장(0024·0025)이 빠져 이름순 짝이 2장씩 밀렸다.
+
+    ★ 비행선은 '연속된 직선 구간(leg)'으로 잡는다. 수직 좌표만으로 묶었더니
+      217 m 폭에서 휜 줄이 쪼개지고 이륙 뒤 이동 구간이 경계 줄에 섞여,
+      EWP 경계 간격을 12.4 m(실제 7.1 m), 시각 차이를 5분(실제 약 20분)으로
+      틀리게 냈다. 시각 차이는 경계 두 줄에서 **같은 자리를 찍은 프레임끼리**
+      비교한다.
+    """
+    pat = re.compile(r"DJI_(\d{14})_(\d{4})")
+    t, q, base = [], [], []
+    for n in names:
+        b = os.path.basename(n)
+        m = pat.search(b)
+        if not m:
+            return None
+        t.append(datetime.strptime(m.group(1), "%Y%m%d%H%M%S"))
+        q.append(int(m.group(2)))
+        base.append(b)
+    N = len(names)
+    sess = np.zeros(N, int)
+    missing = []
+    for i in range(1, N):
+        gap = (t[i] - t[i-1]).total_seconds()
+        new = q[i] <= q[i-1] or gap > 120
+        sess[i] = sess[i-1] + (1 if new else 0)
+        if not new and q[i] > q[i-1] + 1:
+            missing.append((int(sess[i]), q[i-1] + 1, q[i] - 1))
+    ns = int(sess.max()) + 1
+
+    # 주 비행 방향 — 이웃 프레임 이동 방향의 원형 평균 (180° 접기)
+    dx, dy = np.diff(x), np.diff(y)
+    use = (np.hypot(dx, dy) > 0.5) & (np.diff(sess) == 0)
+    th = np.arctan2(dy[use], dx[use]) * 2
+    hrad = 0.5 * np.arctan2(np.sin(th).mean(), np.cos(th).mean()) if use.sum() else 0.0
+    hdom = float(np.degrees(hrad)) % 180
+    ux, uy = np.cos(hrad), np.sin(hrad)
+    u = x * ux + y * uy                                  # 비행 방향 좌표
+    v = -x * uy + y * ux                                 # 비행선에 수직인 좌표
+
+    def legs_of(k):
+        ids = np.where(sess == k)[0]
+        if len(ids) < 6:
+            return []
+        hx, hy = np.diff(x[ids]), np.diff(y[ids])
+        ang = np.degrees(np.arctan2(hy, hx)) % 180
+        dev = np.abs(((ang - hdom) + 90) % 180 - 90)
+        on = (dev < 20) & (np.hypot(hx, hy) > 0.5)
+        legs, cur = [], []
+        for j in range(len(on)):
+            if on[j]:
+                if not cur:
+                    cur = [ids[j]]
+                cur.append(ids[j+1])
+            else:
+                if len(cur) >= 5:
+                    legs.append(np.array(cur))
+                cur = []
+        if len(cur) >= 5:
+            legs.append(np.array(cur))
+        return [(float(np.median(v[L])), L) for L in legs]
+
+    L = {k: legs_of(k) for k in range(ns)}
+    cen = np.sort([c for k in L for c, _ in L[k]])
+    if len(cen) > 1:
+        # 같은 줄의 조각(정지·흔들림으로 끊긴 구간)을 합쳐 줄 중심만 남긴 뒤 간격
+        merged = [cen[0]]
+        for c in cen[1:]:
+            if c - merged[-1] > 1.5:
+                merged.append(c)
+        d = np.diff(merged)
+        spacing = float(np.median(d)) if len(d) else float("nan")
+    else:
+        spacing = float("nan")
+
+    info = dict(n=ns, sess=sess, heading=0.0 if hdom >= 179.5 else hdom,
+                spacing=spacing, missing=missing, pairs=[],
+                thermal=sum(b.upper().endswith("_T.JPG") for b in base) > N // 2)
+    rows = []
+    for k in range(ns):
+        m = sess == k
+        i0, i1 = np.where(m)[0][[0, -1]]
+        rows.append((k, int(m.sum()), t[i0], t[i1], base[i0], base[i1]))
+    info["rows"] = rows
+
+    # ★ 복귀·이동 구간 — 주 방향에서 45° 넘게 벗어난 이동이 3장 이상 이어지고
+    #   비행선 간격의 1.5배를 넘게 가로지른 구간. 선회(한 칸 이동, 3~5장)는 제외.
+    #   EWP: 세션 1 이 끝나고 부지 한가운데를 남북으로 가로지른 24장(0372~0395)이
+    #   RGB·열화상 모두 가운데 이음매를 깨뜨렸다. 빼고 한 번에 풀자 둘 다 풀림.
+    #   (처음엔 '상대 세션 쪽으로 넘어간 프레임'으로 4장만 잡아 기각했었다.)
+    off = set()
+    for a, b in zip(range(N - 1), range(1, N)):
+        if sess[a] != sess[b]:
+            continue
+        ddx, ddy = x[b] - x[a], y[b] - y[a]
+        if np.hypot(ddx, ddy) < 0.5:
+            continue
+        ang = np.degrees(np.arctan2(ddy, ddx)) % 180
+        if abs(((ang - hdom) + 90) % 180 - 90) > 45:
+            off.update((a, b))
+    runs, cur = [], []
+    for i in range(N):
+        if i in off and (not cur or sess[cur[-1]] == sess[i]):
+            cur.append(i)
+        else:
+            if len(cur) >= 3: runs.append(cur)
+            cur = [i] if i in off else []
+    if len(cur) >= 3: runs.append(cur)
+    tr = []
+    umin, umax = float(np.min(u)), float(np.max(u))
+    for r in runs:
+        cross = abs(v[r[-1]] - v[r[0]])
+        if np.isfinite(spacing) and cross <= 1.5 * spacing:
+            continue
+        uf = (np.median(u[r]) - umin) / max(umax - umin, 1e-6)     # 비행 방향으로 부지의 몇 % 지점
+        tr.append(dict(sess=int(sess[r[0]]), first=base[r[0]], last=base[r[-1]], n=len(r),
+                       t0=t[r[0]].strftime("%H:%M:%S"), t1=t[r[-1]].strftime("%H:%M:%S"),
+                       cross=float(cross), mid=bool(0.2 <= uf <= 0.8)))
+    info["transit"] = tr
+    # 세션 지도 (북쪽이 위): 칸마다 어느 세션의 카메라가 있나
+    if ns >= 2:
+        st = np.hypot(np.diff(x), np.diff(y)); st = st[(st > 0.5) & (np.diff(sess) == 0)]
+        step = float(np.median(st)) if len(st) else 7.0
+        sp_ = spacing if np.isfinite(spacing) else step
+        nc = int(np.clip(np.ptp(x) / (1.6 * max(step, sp_ * 0.5)), 12, 48))
+        nr = int(np.clip(np.ptp(y) / (1.6 * max(step, sp_ * 0.5)), 6, 20))
+        xe = np.linspace(x.min(), x.max() + 1e-6, nc + 1)
+        ye = np.linspace(y.max() + 1e-6, y.min(), nr + 1)
+        ci = np.clip(np.searchsorted(xe, x, side="right") - 1, 0, nc - 1)
+        ri = np.clip(np.searchsorted(-ye, -y, side="right") - 1, 0, nr - 1)
+        cell = [[set() for _ in range(nc)] for _ in range(nr)]
+        for i in range(N):
+            cell[ri[i]][ci[i]].add(int(sess[i]))
+        sym = lambda st: " " if not st else ("*" if len(st) > 1 else str(min(st)))
+        info["map"] = ["".join(sym(cell[r][c]) for c in range(nc)) for r in range(nr)]
+
+    for k in range(ns - 1):
+        A, Bl = L[k], L[k+1]
+        if not A or not Bl or not np.isfinite(spacing):
+            continue
+        best = None
+        for ca, la in A:
+            ua = u[la]
+            for cb, lb in Bl:
+                ub = u[lb]
+                ov = min(ua.max(), ub.max()) - max(ua.min(), ub.min())
+                if ov < 20:                     # 비행 방향으로 20 m 이상 함께 지나야 이웃 줄
+                    continue
+                dv = abs(ca - cb)
+                if best is None or dv < best[0]:
+                    best = (dv, la, lb)
+        if best is None:
+            continue
+        dv, la, lb = best
+        # 다시 찍은 줄: 수직 좌표가 0.35 간격 안이고 **비행 방향으로도 20 m 이상 겹치는** 것.
+        # (옥산: 수직 좌표만 보면 1줄이었는데 경계 간격은 8.7 m — 같은 줄 위치를 두 세션이
+        #  서로 다른 구간에서 나눠 찍은 것. 경계가 ㄱ자로 꺾인 경우다.)
+        rep, split_same = 0, 0
+        for cb, lb in Bl:
+            ub = u[lb]
+            for ca, la in A:
+                if abs(ca - cb) >= 0.35 * spacing:
+                    continue
+                ua = u[la]
+                ov = min(ua.max(), ub.max()) - max(ua.min(), ub.min())
+                if ov >= 20:
+                    rep += 1
+                else:
+                    split_same += 1
+                break
+        # 두 세션의 수직 좌표 범위가 두 줄 넘게 겹치면 경계가 비행선과 나란하지 않다
+        va = np.array([c for c, _ in A]); vb = np.array([c for c, _ in Bl])
+        vov = min(va.max(), vb.max()) - max(va.min(), vb.min())
+        # 같은 자리를 찍은 프레임끼리 시각 차이
+        dts = []
+        for j in lb:
+            i = la[np.argmin(np.abs(u[la] - u[j]))]
+            dts.append(abs((t[j] - t[i]).total_seconds()))
+        gap_min = (t[np.where(sess == k+1)[0][0]] - t[np.where(sess == k)[0][-1]]).total_seconds() / 60
+        la, lb = np.sort(la), np.sort(lb)
+        info["pairs"].append(dict(
+            a=k, b=k+1, repeated=int(rep), split_same=int(split_same),
+            v_overlap=float(vov), gap_m=float(dv), minutes=gap_min,
+            line_minutes=float(np.median(dts)) / 60,
+            a_line=(base[la[0]], base[la[-1]]), b_line=(base[lb[0]], base[lb[-1]])))
+    return info
+
+
+_PIPE_NAME = re.compile(r"_(\d{14})_(\d{4})_")
+
+
+def pipeline_transit(names, x, y, min_run=3, dev_deg=45.0, cross_factor=1.5):
+    """homography_pipeline.py 의 detect_transit 과 **같은 계산** (위도·경도 대신 m 좌표를 받음).
+
+    ★ 파이프라인은 이 판정으로 비행선 밖 구간을 **기본으로 빼고** 처리한다(--drop-transit).
+      site_triage 의 기존 판정(6번 위쪽)은 비행 방향 · 간격을 다르게 구해 경계 사례에서
+      갈릴 수 있으므로, 처리 전에 '파이프라인이 실제로 뺄 사진'을 같은 계산으로 보여 준다.
+    """
+    n = len(names)
+    seq, tt = [], []
+    for nm in names:
+        m = _PIPE_NAME.search(os.path.basename(nm))
+        seq.append(int(m.group(2)) if m else None)
+        tt.append(datetime.strptime(m.group(1), "%Y%m%d%H%M%S") if m else None)
+    sess = [0] * n
+    for i in range(1, n):
+        brk = (seq[i] is not None and seq[i - 1] is not None and seq[i] <= seq[i - 1]) or \
+              (tt[i] is not None and tt[i - 1] is not None and (tt[i] - tt[i - 1]).total_seconds() > 120)
+        sess[i] = sess[i - 1] + (1 if brk else 0)
+    cs = ss = 0.0; moves = []
+    for i in range(n - 1):
+        if sess[i] != sess[i + 1]: continue
+        dx, dy = x[i + 1] - x[i], y[i + 1] - y[i]
+        d = math.hypot(dx, dy)
+        if d < 0.5: continue
+        a_ = math.atan2(dy, dx)
+        cs += math.cos(2 * a_) * d; ss += math.sin(2 * a_) * d
+        moves.append((i, a_))
+    if not moves:
+        return None
+    h = 0.5 * math.atan2(ss, cs)
+    ux, uy = math.cos(h), math.sin(h)
+    v = [-xi * uy + yi * ux for xi, yi in zip(x, y)]
+    off = set(); on_v = []
+    for i, a_ in moves:
+        dv = abs(((math.degrees(a_ - h)) + 90) % 180 - 90)
+        if dv > dev_deg: off.update((i, i + 1))
+        else: on_v.extend((v[i], v[i + 1]))
+    on_v.sort(); lines = []; cur = []
+    for val in on_v:
+        if cur and val - cur[-1] > 1.5: lines.append(sum(cur) / len(cur)); cur = []
+        cur.append(val)
+    if cur: lines.append(sum(cur) / len(cur))
+    gaps = sorted(b - a_ for a_, b in zip(lines, lines[1:]) if b - a_ > 1.5)
+    spacing = gaps[len(gaps) // 2] if gaps else None
+    runs, cur = [], []
+    for i in range(n):
+        if i in off and (not cur or sess[cur[-1]] == sess[i]):
+            cur.append(i)
+        else:
+            if len(cur) >= min_run: runs.append(cur)
+            cur = [i] if i in off else []
+    if len(cur) >= min_run: runs.append(cur)
+    out = []
+    for r in runs:
+        cross = abs(v[r[-1]] - v[r[0]])
+        if spacing is None or cross > cross_factor * spacing:
+            out.append(dict(sess=sess[r[0]], i0=r[0], i1=r[-1], n=len(r), cross=cross,
+                            s0=seq[r[0]], s1=seq[r[-1]],
+                            first=os.path.basename(names[r[0]]), last=os.path.basename(names[r[-1]])))
+    return dict(runs=out, heading=math.degrees(h) % 180, spacing=spacing, nsess=max(sess) + 1)
+
+
+def print_pipeline_transit(pt, own):
+    """파이프라인이 기본으로 뺄 사진과, 직접 지정할 때 쓸 --exclude-frames 값."""
+    if pt is None:
+        return
+    runs = pt["runs"]
+    total = sum(r["n"] for r in runs)
+    print()
+    print("   파이프라인이 기본으로 뺄 사진 (homography_pipeline --drop-transit, 같은 계산):")
+    if not runs:
+        print("     없음 — 기본값이 이 부지의 결과를 바꾸지 않습니다")
+    else:
+        for r in runs:
+            print("     세션 %d  %04d ~ %04d  (%d장, %.0f m 가로지름)   %s ~ %s"
+                  % (r["sess"], r["s0"], r["s1"], r["n"], r["cross"], r["first"], r["last"]))
+        spec = ",".join(("%d:%d-%d" % (r["sess"], r["s0"], r["s1"])) if pt["nsess"] > 1 else ("%d-%d" % (r["s0"], r["s1"]))
+                        for r in runs)
+        print("     모두 %d장.  빼지 않으려면 --keep-transit,  같은 사진만 직접 빼려면 --keep-transit --exclude-frames %s"
+              % (total, spec))
+    mine = sorted((r["first"], r["last"]) for r in (own or []))
+    theirs = sorted((r["first"], r["last"]) for r in runs)
+    if mine != theirs:
+        print("     ★ 위의 비행선 밖 구간 목록과 다릅니다 — 파이프라인은 이 목록대로 뺍니다."
+              " 차이가 나는 구간을 눈으로 확인하십시오.")
+
+
+def print_sessions(info):
+    print()
+    print("6. 촬영 세션 (파일명의 촬영 시각 · 순번)")
+    if info is None:
+        print("   파일명이 DJI_YYYYMMDDhhmmss_NNNN 형식이 아니라 판정 불가")
+        return
+    for k, cnt, t0, t1, b0, b1 in info["rows"]:
+        print("   세션 %d  %4d장  %s ~ %s" % (k, cnt, t0.strftime("%H:%M"), t1.strftime("%H:%M")))
+    if np.isfinite(info["spacing"]):
+        print("   비행선 간격 %.1f m,  비행 방향 %.0f°  (0° = 동서, 90° = 남북)"
+              % (info["spacing"], info["heading"]))
+    for s0, a, b in info["missing"]:
+        print("   ★ 세션 %d 에서 번호 %04d~%04d 누락 (%d장) — 다른 센서와 이름순으로"
+              " 짝지으면 그 뒤가 밀립니다" % (s0, a, b, b - a + 1))
+    tr = info.get("transit") or []
+    if tr:
+        print("   ★ 비행선 밖 구간(복귀·이동) %d곳, 모두 %d장:" % (len(tr), sum(r["n"] for r in tr)))
+        for r in tr:
+            print("     세션 %d  %s ~ %s  (%d장, %s ~ %s, %.0f m 가로지름%s)"
+                  % (r["sess"], r["first"], r["last"], r["n"], r["t0"], r["t1"], r["cross"],
+                     ", 부지 한가운데" if r["mid"] else ", 가장자리 쪽"))
+        if any(r["mid"] for r in tr):
+            print("     부지 한가운데를 지난 구간은 모자이크에 자주 뽑혀 패널을 1~2 m 밀어냅니다")
+            print("     (EWP 실측). 빼고 처리하십시오:")
+            print("       session_tools.py transit --cameras <실행>/cameras.npz --image-dir <사진> --out <새 폴더>")
+    elif info["n"] >= 1:
+        print("   비행선 밖 구간(복귀·이동) 없음")
+    if info["n"] == 1:
+        print("   세션 1개 — 경계 문제 없음")
+        return
+    if "map" in info:
+        print("   세션 지도 (북쪽이 위, 숫자 = 세션, * = 두 세션이 한 칸에)")
+        for line in info["map"]:
+            print("     |%s|" % line)
+    for p in info["pairs"]:
+        print()
+        print("   세션 %d ↔ %d   재개까지 %.0f분,  다시 찍은 줄 %d개,  경계 줄 간격 %.1f m"
+              % (p["a"], p["b"], p["minutes"], p["repeated"], p["gap_m"]))
+        print("     경계 두 줄의 촬영 시각 차이 %.0f분" % p["line_minutes"])
+        print("     경계 줄  세션 %d: %s ~ %s" % (p["a"], *p["a_line"]))
+        print("              세션 %d: %s ~ %s" % (p["b"], *p["b_line"]))
+        # ★ 옥산: 경계는 곧은데 경계 줄 하나를 두 세션이 구간을 나눠 찍었다(1줄).
+        #   이런 들쭉날쭉함은 경계 띠 안에 들어가므로 세 조각 처리가 된다.
+        #   두 선 자르기가 안 되는 것은 여러 줄에 걸쳐 꺾일 때(ㄱ자)다.
+        partial = p["split_same"] > 0 and p["split_same"] <= 2 and p["v_overlap"] <= 3 * info["spacing"]
+        nonpar = (p["split_same"] > 2) or (p["v_overlap"] > 3 * info["spacing"])
+        if partial:
+            print("   → 경계 줄 %d개를 두 세션이 구간을 나눠 찍었습니다. 경계는 곧고, 나뉜 줄은"
+                  % p["split_same"])
+            print("     경계 띠 안에 들어가므로 세 조각 처리가 됩니다.")
+        elif nonpar:
+            print("   ★ 경계가 비행선과 나란하지 않습니다 — %d줄에 걸쳐 두 세션이 구간을 나눠"
+                  % p["split_same"])
+            print("     찍었습니다. 위 지도에서 경계가 꺾이는지 보십시오. session_tools.py 의")
+            print("     두 선 자르기는 이 경우 맞지 않습니다.")
+        if p["repeated"] == 0:
+            print("   ★ 두 비행이 **겹친 줄 없이** 맞닿았습니다. 경계 두 줄이 각 블록의")
+            print("     가장자리라, 한 번에 풀면 경계 이음매가 조각나고 세션별로 풀면")
+            print("     경계 쪽이 기울어 보입니다 (EWP 실측).")
+            if not nonpar:
+                print("     처리: 세션별 모자이크 + 경계 띠(양쪽 3~6줄)만 함께 푼 모자이크를")
+                print("           줄 사이 땅에서 잘라 붙이십시오.")
+            print("     촬영: 재개할 때 앞 비행의 마지막 한두 줄을 다시 찍으십시오.")
+        else:
+            print("   → 재개 때 %d줄을 다시 찍었습니다. 세션별로 만들어 겹친 줄 가운데서"
+                  % p["repeated"])
+            print("     잘라 붙이면 됩니다.")
+        if p["line_minutes"] > 10:
+            print("   ★ 경계 두 줄이 %.0f분 차이 — 햇빛·반사가 달라 경계에서 색이 조각나고"
+                  % p["line_minutes"])
+            print("     노출 이득이 양 끝(clip)으로 밀릴 수 있습니다.")
+            if info["thermal"]:
+                print("     열화상은 패널 온도도 달라지니 세션을 섞지 마십시오.")
+
+
 def bar(v, ref, better_low, width=22):
     """기준 대비 막대. 기준=1.0 위치에 | 를 찍는다."""
-    ratio = (ref / v) if better_low else (v / ref)
+    ratio = (ref / max(v, 1e-9)) if better_low else (v / max(ref, 1e-9))
     n = int(np.clip(ratio, 0, 2) / 2 * width)
     return "#" * n + "." * (width - n) + ("  %.2fx" % ratio)
 
@@ -183,6 +742,8 @@ def main():
                          "summary.json 의 focal_calibration.f_px_final")
     ap.add_argument("--image-w", type=float, default=None,
                     help="영상 가로 픽셀 (기본 4000)")
+    ap.add_argument("--image-dir", default=None,
+                    help="TSV 를 만든 사진 폴더 — 주면 촬영 세션·누락·경계를 검사")
     a = ap.parse_args()
 
     if a.cameras and a.alt:
@@ -366,7 +927,8 @@ def main():
                   % (slope, rmse))
             print("        가로지른 **허수입니다.** 경사 보정을 하지 마십시오.")
             print("      → 패널이 있는 층 하나를 기준면으로 잡으십시오.")
-            print("        (옥상 설치면 위층. P5 override 로 그 층의 평면 지정)")
+            print("        (옥상 설치면 위층. 그 층의 평면을 옥상 프레임으로 재서 P5 override)")
+            _report_roof(x, y, gz, ok, t, frame_w, frame_h)
         elif rmse > 1.5:
             print("   ★ RMSE 가 1.5 m 를 넘습니다 — 단일 평면 모델이 "
                   "성립하지 않습니다. 기준면을 어떻게 잡아도 이만큼 남습니다.")
@@ -375,6 +937,7 @@ def main():
                   "plane_sweep 으로 확인하십시오.**")
         else:
             print("   → 평면 모델은 성립하지만 경사는 확인이 필요합니다.")
+        raised = None if two_level else _report_raised(x, y, gz, ok, frame_w, frame_h)
         # ★ 한때 "RMSE<1.0 이면 LRF 경사를 쓰라" 고 안내했으나 반증됐다.
         #   실측: LRF 1.288°, 파이프라인 채택 0.830°, plane_sweep 실측
         #   2.237°. 후자를 적용하니 어긋남 0.158 → 0.102 m (35% 개선).
@@ -395,6 +958,44 @@ def main():
             print("   두 값이 비슷하게 변합니다 — P7 영향은 작습니다.")
     else:
         print("   판정 불가")
+
+    # ── 6. 촬영 세션 ───────────────────────────────────────────────
+    sinfo = None
+    if a.image_dir:
+        names = sorted(glob.glob(os.path.join(a.image_dir, "*.JPG")) +
+                       glob.glob(os.path.join(a.image_dir, "*.jpg")),
+                       key=lambda p: os.path.basename(p))
+        if len(names) != n:
+            print()
+            print("6. 촬영 세션")
+            print("   ★ 사진 %d장과 TSV %d행이 다릅니다 — 같은 폴더로 TSV 를 만드십시오"
+                  % (len(names), n))
+        else:
+            sinfo = analyze_sessions(names, x, y)
+            print_sessions(sinfo)
+            ptr = pipeline_transit(names, list(x), list(y))
+            print_pipeline_transit(ptr, (sinfo or {}).get("transit"))
+            if sinfo is not None:
+                sinfo["pipe_transit"] = ptr
+
+    def _session_tail():
+        pt = (sinfo or {}).get("pipe_transit")
+        if pt and pt["runs"]:
+            print()
+            print("  ※ 파이프라인은 비행 방향이 다른 구간 %d장을 기본으로 빼고 처리합니다 (6번 목록)."
+                  % sum(r["n"] for r in pt["runs"]))
+        if sinfo is not None and any(r["mid"] for r in (sinfo.get("transit") or [])):
+            print()
+            print("  ※ 부지 한가운데를 가로지른 비행선 밖 구간(복귀·이동)이 있습니다 — 6번의")
+            print("    목록을 빼고 처리하십시오. EWP 가운데 이음매가 깨진 주원인이었습니다.")
+        if sinfo is None or sinfo["n"] < 2:
+            return
+        flat = [p for p in sinfo["pairs"] if p["repeated"] == 0]
+        print()
+        print("  ※ 촬영 세션 %d개%s — 경계 비행선에서 이음매를 따로 확인하십시오."
+              % (sinfo["n"], " (겹친 줄 없이 맞닿음)" if flat else ""))
+        print("    기준면은 세션마다 plane_sweep 으로 재십시오 (EWP 실측: 자동 기준면이")
+        print("    세션마다 2.7~3.7 m 틀렸고, 재면 경계에서 같은 높이로 모였습니다).")
 
     # ── 종합 ───────────────────────────────────────────────────────
     print()
@@ -451,10 +1052,12 @@ def main():
             print("   - " + f)
         print()
         if two_level:
-            print("  **경사 보정을 하지 마십시오.** 이 부지는 기울어진 것이")
-            print("  아니라 두 층으로 나뉜 것입니다. 패널이 있는 층(옥상이면")
-            print("  위층)의 평면만 P5 override 로 지정하십시오.")
-            print("  다른 층은 모자이크에서 잘라내는 편이 낫습니다.")
+            print("  **전체 경사 보정을 하지 마십시오.** 이 부지는 기울어진 것이")
+            print("  아니라 두 층으로 나뉜 것입니다. 패널이 있는 층(옥상이면 위층)의")
+            print("  평면을 **그 층 위 프레임만으로** plane_sweep 해서 재고 P5 override")
+            print("  로 지정하십시오(4번의 ROOF_STARTS). 프레임이 옥상보다 큰 센서는")
+            print("  열화상으로 잰 평면을 옮기십시오. 다른 층은 잘라내는 편이 낫습니다.")
+            _session_tail()
             print("=" * 68)
             return
         print("  기본 설정을 쓰지 마십시오 — **경사 보정이 실제로 듣습니다.**")
@@ -472,6 +1075,10 @@ def main():
                   % relief)
             print("  고도가 자리마다 달라져 충전율이 떨어집니다. 지형추종")
             print("  (terrain-follow) 비행을 검토하십시오.")
+    _session_tail()
+    if not a.image_dir:
+        print()
+        print("  ※ --image-dir <사진 폴더> 를 주면 촬영 세션·누락도 검사합니다.")
     print("=" * 68)
 
 

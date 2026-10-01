@@ -1366,3 +1366,120 @@ python scripts/plane_sweep.py --image-dir $IMAGE_DIR/TM \
 python scripts/qc_tear.py $IMAGE_DIR/tm_release/mosaic_core.tif \
     --window --x 192795 --y 235055 --size 3300 2000 --block-m 12 --pitch-m 2.0
 
+
+
+gcloud storage cp gs://solar-plant/webodm/장흥군그린환경센터_R.zip ~/Development/sayouzone/solar-thermal/data/solar/
+gcloud storage cp gs://solar-plant/webodm/장흥군그린환경센터_T.zip ~/Development/sayouzone/solar-thermal/data/solar/
+
+
+
+
+
+python scripts/qc_tear.py $IMAGE_DIR/tilt/mosaic.tif <ODM>/odm_orthophoto.tif \
+    --window --x 188530 --y 279200 --size 5500 4500 --block-m 12 --pitch-m $PITCH
+
+python scripts/qc_tear.py $IMAGE_DIR/tilt2/mosaic.tif <ODM>/odm_orthophoto.tif \
+    --window --x 188380 --y 279090 --size 5000 4000 --block-m 12 --pitch-m 2.30
+
+python scripts/qc_tear.py $IMAGE_DIR/tilt/mosaic.tif <ODM>/odm_orthophoto.tif \
+    --window --x 188370 --y 279100 --size 7000 5500 --block-m 12 --pitch-m 2.31
+
+
+python scripts/qc_tear.py $IMAGE_DIR/tilt/mosaic.tif <ODM>/odm_orthophoto.tif \
+    --window --x 188370 --y 279100 --size 7000 5500 --block-m 12 --pitch-m 2.31
+
+
+
+
+IMAGE_DIR=~/Development/sayouzone/solar-thermal/data/solar/그린환경센터
+ODM_DIR=~/Development/sayouzone/solar-thermal/data/solar/webodm/장흥군그린환경센터/장흥군그린환경센터_R/odm_orthophoto
+
+python scripts/qc_tear.py $IMAGE_DIR/release/mosaic.tif $ODM_DIR/odm_orthophoto.tif \
+    --window --x 192795 --y 235055 --size 8500 5000 --block-m 12 --pitch-m 2.0
+
+
+
+
+ODM_DIR=~/Development/sayouzone/solar-thermal/data/solar/webodm/장흥군그린환경센터/장흥군그린환경센터_T/odm_orthophoto
+python scripts/qc_tear.py $IMAGE_DIR/tm_release/mosaic.tif $ODM_DIR/odm_orthophoto.tif \
+    --window --x 192795 --y 235055 --size 8500 5000 --block-m 12 --pitch-m 2.0
+
+
+
+IMAGE_DIR=~/Development/sayouzone/solar-thermal/data/solar/에스엘에너지_사천시
+ODM_DIR=~/Development/sayouzone/solar-thermal/data/solar/webodm/에스엘에너지_사천시/에스엘에너지_사천시_R/odm_orthophoto
+
+python scripts/qc_tear.py $IMAGE_DIR/rgb_release/mosaic.tif $ODM_DIR/odm_orthophoto.tif \
+    --window --x 192795 --y 235055 --size 8500 5000 --block-m 12 --pitch-m 2.0
+
+
+ODM_TM=~/Development/sayouzone/solar-thermal/data/solar/webodm/에스엘에너지_사천시/에스엘에너지_사천시_T/odm_orthophoto
+gdalinfo "$ODM_TM" | grep -E "Size is|Pixel Size"
+
+
+B=~/Development/sayouzone/solar-thermal/data/solar/webodm/에스엘에너지_사천시/에스엘에너지_사천시_R
+find $B -name "images.json" -o -name "shots.geojson" | head
+python -c "
+import json,glob,collections
+for f in glob.glob('$B/**/images.json', recursive=True):
+    im=json.load(open(f))
+    print(len(im),'장', dict(collections.Counter((d['width'],d['height']) for d in im)))"
+
+
+
+
+python -c "
+import rasterio, numpy as np
+from rasterio.windows import from_bounds
+from PIL import Image
+pairs = [('sayou', '$IMAGE_DIR/release/mosaic.tif'),
+         ('odm',   '/tmp/odm_green_5186.tif')]
+# 패널 배열 중앙 30 x 20 m
+X0, Y0, X1, Y1 = 192840, 235000, 192870, 235020
+for name, p in pairs:
+    d = rasterio.open(p)
+    w = from_bounds(X0, Y0, X1, Y1, d.transform)
+    a = np.transpose(d.read(indexes=[1,2,3], window=w), (1,2,0)).astype(np.uint8)
+    Image.fromarray(a).save(f'/tmp/cmp_{name}.jpg', quality=92)
+    print(name, a.shape)
+"
+
+
+python -c "
+import rasterio, numpy as np, cv2
+for name, p in [('sayou', '$IMAGE_DIR/release/mosaic.tif'),
+                ('odm',   '/tmp/odm_green_5186.tif')]:
+    d = rasterio.open(p)
+    from rasterio.windows import from_bounds
+    w = from_bounds(192840, 235000, 192870, 235020, d.transform)
+    a = np.transpose(d.read(indexes=[1,2,3], window=w), (1,2,0))
+    g = cv2.cvtColor(a, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    # 32 px 블록 평균의 산포 = 넓은 범위 밝기 얼룩
+    h, wd = g.shape
+    b = g[:h//32*32, :wd//32*32].reshape(h//32, 32, wd//32, 32).mean((1,3))
+    lo = cv2.GaussianBlur(b, (0,0), 6)     # 아주 느린 성분
+    print('%-6s 넓은범위 밝기 표준편차 %.2f   (블록평균 %.1f)'
+          % (name, float((b-lo).std()), float(b.mean())))
+"
+
+
+python -c "
+import rasterio, numpy as np, cv2
+from rasterio.windows import from_bounds
+for name, p in [('sayou', '$IMAGE_DIR/release/mosaic.tif'),
+                ('odm',   '/tmp/odm_green_5186.tif')]:
+    d = rasterio.open(p)
+    w = from_bounds(192840, 235000, 192870, 235020, d.transform)
+    a = np.transpose(d.read(indexes=[1,2,3], window=w), (1,2,0))
+    g = cv2.cvtColor(a, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    # 패널 주기(2 m = 133 px)를 지우려면 그보다 크게 평균낸다
+    k = 201                      # 3 m
+    b = cv2.blur(g, (k, k))
+    lo = cv2.blur(g, (601, 601)) # 9 m — 조명·지형의 완만한 변화
+    resid = b - lo               # 3~9 m 규모 얼룩 = 프레임 경계 후보
+    m = g > 0
+    print('%-6s 3~9m 규모 밝기 얼룩 표준편차 %.2f   전체평균 %.1f'
+          % (name, float(resid[m].std()), float(g[m].mean())))
+"
+
+

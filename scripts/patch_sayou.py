@@ -67,6 +67,7 @@ python patch_sayou.py --root <설치루트>/sayou --revert  # 되돌리기
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -439,6 +440,138 @@ def smooth_weak_attitudes(rotations: list,""",
                         _ceil, 100.0 * float(_over.mean()),
                         float(np.degrees(np.arctan(_ceil))))""",
     ),
+    # -- P10: 매칭 단계 영상 축소 ---------------------------------------
+    #  * 원해상도에서 SIFT 서술자가 담는 것이 **패널 셀 격자**(1~2 cm 주기)
+    #    다. 그 무늬는 부지 어디서나 똑같아 구분이 안 된다. 축소하면 같은
+    #    서술자가 더 넓은 지상 면적 - 모듈(~1 m)/테이블(~2 m) 규모의 배치 -
+    #    을 담아 자리마다 달라진다.
+    #
+    #    실측 (probe, 쌍 20개, 비행선 교차 inlier 중앙값):
+    #        부지   1.00배  0.50배  0.25배
+    #        옥산      8       9      78
+    #        사천      8      19     138
+    #        EWP      33      64     451
+    #
+    #    특징점 개수 문제가 아니다. 원해상도에서 상한을 8천 -> 4만으로
+    #    5배 늘려도 사천 8 -> 14, 옥산 8 -> 17 에 그쳤다. 0.25배 축소가
+    #    같은 8천 개로 138/78 을 낸다.
+    #
+    #  * 좌표를 반드시 되돌려야 한다. 축소 좌표를 그대로 BA 에 넘기면
+    #    모든 자세가 통째로 틀어진다. 아래 kp 복원이 그것이다.
+    #
+    #  * 대가: 키포인트 위치 정밀도가 배율만큼 떨어진다. 0.25배에서 1 px
+    #    오차는 원본 4 px 다. 대응이 많아지는 것과 BA 가 정확해지는 것은
+    #    다르므로, 반드시 qc_tear 로 최종 확인할 것.
+    #
+    #      export SAYOU_MATCH_SCALE=0.5     # 0.25 ~ 1.0
+    dict(
+        name="P10a 추출 시 축소·좌표복원",
+        path="homography/features/extract.py",
+        old=(
+            "def extract_features(image_path: Path, max_features: int = 8000):\n"
+            "    img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)\n"
+            "    \n"
+            "    detector = cv2.SIFT_create(nfeatures=max_features)\n"
+            "    kp, desc = detector.detectAndCompute(img, None)\n"
+            "\n"
+            "    #detector = cv2.ORB_create(nfeatures=max_features)\n"
+            "    #kp, desc = detector.detectAndCompute(img, None)\n"
+            "    #print(kp, type(kp), desc, type(desc))\n"
+            "    \n"
+            "    return kp, desc, img.shape\n"
+        ),
+        new=(
+            "def extract_features(image_path: Path, max_features: int = 8000,\n"
+            "                     match_scale: float = 1.0):\n"
+            "    img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)\n"
+            "    if img is None:\n"
+            "        return [], None, (0, 0)\n"
+            "    # [sayou-patch] 매칭용 축소. shape 은 **원본**을 반환하고\n"
+            "    #   키포인트 좌표는 아래에서 원본 스케일로 되돌린다.\n"
+            "    full_shape = img.shape\n"
+            "    s = float(match_scale)\n"
+            "    if not (0.05 < s < 1.0):\n"
+            "        s = 1.0\n"
+            "    if s != 1.0:\n"
+            "        img = cv2.resize(img, None, fx=s, fy=s,\n"
+            "                         interpolation=cv2.INTER_AREA)\n"
+            "\n"
+            "    detector = cv2.SIFT_create(nfeatures=max_features)\n"
+            "    kp, desc = detector.detectAndCompute(img, None)\n"
+            "\n"
+            "    if s != 1.0 and kp:\n"
+            "        # * 이 복원을 빠뜨리면 BA 가 통째로 틀어진다.\n"
+            "        inv = 1.0 / s\n"
+            "        kp = [cv2.KeyPoint(x=float(k.pt[0]) * inv,\n"
+            "                           y=float(k.pt[1]) * inv,\n"
+            "                           size=float(k.size) * inv,\n"
+            "                           angle=float(k.angle),\n"
+            "                           response=float(k.response),\n"
+            "                           octave=int(k.octave),\n"
+            "                           class_id=int(k.class_id)) for k in kp]\n"
+            "    return kp, desc, full_shape\n"
+        ),
+    ),
+    dict(
+        name="P10b build_tie_points 전달",
+        path="homography/features/pairs.py",
+        old=(
+            "def build_tie_points(metas: list[ImageMetadata],\n"
+            "                     pairs: list[tuple[int, int]]):\n"
+        ),
+        new=(
+            "def build_tie_points(metas: list[ImageMetadata],\n"
+            "                     pairs: list[tuple[int, int]],\n"
+            "                     match_scale: float = 1.0):\n"
+        ),
+    ),
+    dict(
+        name="P10c 추출 호출에 배율 적용",
+        path="homography/features/pairs.py",
+        old=(
+            "    features = {i: extract_features(metas[i].origin_path) "
+            "for i in needed}\n"
+        ),
+        new=(
+            "    features = {i: extract_features(metas[i].origin_path,\n"
+            "                                    match_scale=match_scale)\n"
+            "                for i in needed}\n"
+            "    if match_scale != 1.0:\n"
+            "        logger.info(\"  매칭용 축소 %.2f배 - 서술자가 담는 지상 \"\n"
+            "                    \"면적이 %.0f배 넓어집니다 (좌표는 원본 \"\n"
+            "                    \"스케일로 복원).\", match_scale,\n"
+            "                    1.0 / (match_scale ** 2))\n"
+        ),
+    ),
+    dict(
+        name="P10d 배율 읽기·캐시 키",
+        path="homography/pipeline.py",
+        old='        _ckey = {"pairs": len(pairs), "k_neighbors": k_neighbors}\n',
+        new=(
+            "        # [sayou-patch] 배율이 캐시 키에 들어가야 한다. 빠뜨리면\n"
+            "        #   다른 배율로 만든 이전 캐시를 그대로 재사용해\n"
+            "        #   아무것도 바뀌지 않는다.\n"
+            "        import os as _os\n"
+            "        try:\n"
+            "            _mscale = float(\n"
+            "                _os.environ.get(\"SAYOU_MATCH_SCALE\", \"1\") or 1)\n"
+            "        except ValueError:\n"
+            "            _mscale = 1.0\n"
+            "        if not (0.05 < _mscale <= 1.0):\n"
+            "            _mscale = 1.0\n"
+            '        _ckey = {"pairs": len(pairs), "k_neighbors": k_neighbors,\n'
+            '                 "match_scale": _mscale}\n'
+        ),
+    ),
+    dict(
+        name="P10e build_tie_points 호출",
+        path="homography/pipeline.py",
+        old="            matches, features = build_tie_points(metas, pairs)\n",
+        new=(
+            "            matches, features = build_tie_points(\n"
+            "                metas, pairs, match_scale=_mscale)\n"
+        ),
+    ),
     # -- P4: 스무딩된 자세도 저장 ---------------------------------------------
     #  ★ cams_opt 은 BA 직후 값이고, 자세 스무딩은 그 뒤 호모그래피 단계에서만
     #    _R_all 에 적용된다. 그래서 cameras.npz 만 보면 스무딩 효과가 전혀
@@ -540,7 +673,11 @@ def run(root: Path, apply: bool, revert: bool, skip=(), only=()) -> int:
     for p in PATCHES:
         pid = p["name"].split()[0]
         # P1 / P1b 는 서로 다른 항목이고, P2a~P2e 는 한 묶음이다.
-        grp = pid if pid in ("P1", "P1b") else pid[:2]
+        # ★ 예전엔 pid[:2] 로 잘랐는데, 두 자리 번호가 생기자 **P10a 가
+        #   P1 로 접혔다.** P1 과 충돌하고 --only P10 도 안 먹었다.
+        #   숫자 전체를 그룹으로 삼는다 (P1b 만 예외).
+        _m = re.match(r"^(P\d+)", pid)
+        grp = pid if pid == "P1b" else (_m.group(1) if _m else pid)
         if only and grp not in only:
             continue
         if grp in skip:

@@ -49,193 +49,6 @@ sys.path.insert(0, str(ROOT / "label_studio"))
 from sayou.homography import run_homography_pipeline
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 비행선 밖 구간(복귀·이동) 제외
-#   ★ EWP-서오창IC-2: 세션 1 이 끝나고 부지 한가운데를 남북으로 가로지른 24장
-#     (0372~0395, 11:11:42~11:12:34)이 모자이크에 자주 뽑혀 패널을 1~2 m 밀어냈다.
-#     빼고 한 번에 풀자 RGB · 열화상 모두 가운데가 이어졌다. 전 부지 점검에서
-#     이 조건에 걸린 곳은 EWP 뿐 — 기본으로 켠다(--keep-transit 로 끔).
-#   ★ 판정: 주 비행 방향에서 dev° 넘게 벗어난 이동이 min_run 장 이상 이어지고,
-#     그 구간이 비행선 간격 × 1.5 를 넘게 가로지름. 줄 끝 선회(한 칸 이동,
-#     3~5장)는 가로지른 거리로 걸러진다 (EWP 선회 아홉 곳 제외 확인).
-# ─────────────────────────────────────────────────────────────────────────────
-import math as _math
-import re as _re
-from datetime import datetime as _dt
-
-_DJI_NAME = _re.compile(r"_(\d{14})_(\d{4})_")
-
-
-def _gps_of(path):
-    """JPG EXIF 의 위도·경도 (도). 없으면 None."""
-    try:
-        from PIL import Image
-        ex = Image.open(path).getexif()
-        g = ex.get_ifd(0x8825)
-        if not g or 2 not in g or 4 not in g:
-            return None
-        dms = lambda v: float(v[0]) + float(v[1]) / 60 + float(v[2]) / 3600
-        lat, lon = dms(g[2]), dms(g[4])
-        if g.get(1, "N") in ("S", b"S"): lat = -lat
-        if g.get(3, "E") in ("W", b"W"): lon = -lon
-        return lat, lon
-    except Exception:
-        return None
-
-
-def detect_transit(names, lat, lon, min_run=3, dev_deg=45.0, cross_factor=1.5):
-    """비행선 밖 구간 목록 [(시작, 끝 인덱스, 장수, 가로지른 m)] 과 비행 방향 · 간격."""
-    n = len(names)
-    lat0 = _math.radians(sum(lat) / n)
-    x = [(lo - lon[0]) * 111320.0 * _math.cos(lat0) for lo in lon]
-    y = [(la - lat[0]) * 110540.0 for la in lat]
-    # 세션: 순번이 되돌아가거나 촬영 간격이 120 초를 넘으면 끊음
-    seq, tt = [], []
-    for nm in names:
-        m = _DJI_NAME.search(nm)
-        seq.append(int(m.group(2)) if m else None)
-        tt.append(_dt.strptime(m.group(1), "%Y%m%d%H%M%S") if m else None)
-    sess = [0] * n
-    for i in range(1, n):
-        brk = (seq[i] is not None and seq[i - 1] is not None and seq[i] <= seq[i - 1]) or \
-              (tt[i] is not None and tt[i - 1] is not None and (tt[i] - tt[i - 1]).total_seconds() > 120)
-        sess[i] = sess[i - 1] + (1 if brk else 0)
-    # 주 비행 방향: 이동 방향의 원형 평균 (180° 접기)
-    cs = ss = 0.0; moves = []
-    for i in range(n - 1):
-        if sess[i] != sess[i + 1]: continue
-        dx, dy = x[i + 1] - x[i], y[i + 1] - y[i]
-        d = _math.hypot(dx, dy)
-        if d < 0.5: continue
-        a = _math.atan2(dy, dx)
-        cs += _math.cos(2 * a) * d; ss += _math.sin(2 * a) * d
-        moves.append((i, a))
-    if not moves:
-        return [], None, None
-    h = 0.5 * _math.atan2(ss, cs)
-    ux, uy = _math.cos(h), _math.sin(h)
-    v = [-xi * uy + yi * ux for xi, yi in zip(x, y)]
-    off = set(); on_v = []
-    for i, a in moves:
-        dv = abs(((_math.degrees(a - h)) + 90) % 180 - 90)
-        if dv > dev_deg: off.update((i, i + 1))
-        else: on_v.extend((v[i], v[i + 1]))
-    # 비행선 간격: 비행 방향 이동의 수직 좌표를 1.5 m 안에서 묶은 줄 중심의 간격 중앙값
-    on_v.sort(); lines = []; cur = []
-    for val in on_v:
-        if cur and val - cur[-1] > 1.5: lines.append(sum(cur) / len(cur)); cur = []
-        cur.append(val)
-    if cur: lines.append(sum(cur) / len(cur))
-    gaps = sorted(b - a for a, b in zip(lines, lines[1:]) if b - a > 1.5)
-    spacing = gaps[len(gaps) // 2] if gaps else None
-    runs, cur = [], []
-    for i in range(n):
-        if i in off and (not cur or sess[cur[-1]] == sess[i]):
-            cur.append(i)
-        else:
-            if len(cur) >= min_run: runs.append(cur)
-            cur = [i] if i in off else []
-    if len(cur) >= min_run: runs.append(cur)
-    out = []
-    for r in runs:
-        cross = abs(v[r[-1]] - v[r[0]])
-        if spacing is None or cross > cross_factor * spacing:
-            out.append((r[0], r[-1], len(r), cross))
-    return out, (_math.degrees(h) % 180), spacing
-
-
-def _sessions_of(names):
-    """파일명 순번이 되돌아가거나 촬영 간격이 120 초를 넘으면 새 세션 (0부터)."""
-    sess, prev = [], None
-    for nm in names:
-        m = _DJI_NAME.search(nm)
-        cur = (_dt.strptime(m.group(1), "%Y%m%d%H%M%S"), int(m.group(2))) if m else None
-        if not sess:
-            sess.append(0)
-        elif cur and prev and (cur[1] <= prev[1] or (cur[0] - prev[0]).total_seconds() > 120):
-            sess.append(sess[-1] + 1)
-        else:
-            sess.append(sess[-1])
-        prev = cur or prev
-    return sess
-
-
-def _parse_ranges(txt):
-    """'372-395,500' 또는 세션을 붙인 '1:372-395' → [(세션 또는 None, 순번 집합)]."""
-    out = []
-    for part in (txt or "").replace(" ", "").split(","):
-        if not part: continue
-        ses = None
-        if ":" in part:
-            a, part = part.split(":", 1); ses = int(a)
-        if "-" in part:
-            a, b = part.split("-", 1); nums = set(range(int(a), int(b) + 1))
-        else:
-            nums = {int(part)}
-        out.append((ses, nums))
-    return out
-
-
-def stage_images(image_dir, glob_pattern, output_dir, drop_transit, exclude_frames,
-                 min_run=3, dev_deg=45.0):
-    """제외할 사진을 뺀 링크 폴더를 만들어 그 경로와 기록을 돌려준다. 뺄 것이 없으면 원래 폴더."""
-    import glob as _glob
-    paths = sorted(_glob.glob(os.path.join(image_dir, glob_pattern)))
-    names = [os.path.basename(p) for p in paths]
-    drop, record = set(), {"transit": [], "manual": []}
-    if drop_transit and len(paths) >= 10:
-        g = [_gps_of(p) for p in paths]
-        ok = [i for i, v in enumerate(g) if v is not None]
-        if len(ok) >= 10:
-            sub = [names[i] for i in ok]
-            runs, hdeg, spacing = detect_transit(sub, [g[i][0] for i in ok], [g[i][1] for i in ok],
-                                                 min_run=min_run, dev_deg=dev_deg)
-            for a, b, cnt, cross in runs:
-                idx = ok[a:b + 1]
-                drop.update(idx)
-                record["transit"].append(dict(first=names[idx[0]], last=names[idx[-1]], frames=cnt,
-                                              cross_m=round(cross, 1)))
-            logging.info("비행선 밖 구간 검사: 비행 방향 %.0f°, 비행선 간격 %s — %d곳 %d장",
-                         hdeg or 0, "%.1f m" % spacing if spacing else "?",
-                         len(record["transit"]), sum(r["frames"] for r in record["transit"]))
-            for r in record["transit"]:
-                logging.warning("  비행선 밖 구간 제외: %s ~ %s (%d장, %.0f m 가로지름)",
-                                r["first"], r["last"], r["frames"], r["cross_m"])
-        else:
-            logging.warning("비행선 밖 구간 검사: GPS 를 읽은 사진이 %d장뿐 — 건너뜀", len(ok))
-    if exclude_frames:
-        # ★ 두 비행은 각자 0001 부터 순번을 매긴다 — EWP 는 세션 0 에도 0372~0395 가 있다.
-        #   세션을 붙여 지정하고('1:372-395'), 세션 없이 쓴 번호가 여러 세션에 걸리면 멈춘다.
-        sess = _sessions_of(names)
-        for ses, nums in _parse_ranges(exclude_frames):
-            hit = [i for i, nm in enumerate(names)
-                   if (m := _DJI_NAME.search(nm)) and int(m.group(2)) in nums and (ses is None or sess[i] == ses)]
-            where = sorted(set(sess[i] for i in hit))
-            if ses is None and len(where) > 1:
-                raise SystemExit("--exclude-frames: 순번 %s 이(가) 세션 %s 모두에 있습니다. "
-                                 "세션을 붙여 지정하십시오 (예: %d:%d-%d). 세션 %d개: %s"
-                                 % (exclude_frames, where, where[-1], min(nums), max(nums), max(sess) + 1,
-                                    ", ".join("세션 %d %d장" % (k, sess.count(k)) for k in range(max(sess) + 1))))
-            for i in hit:
-                if i not in drop:
-                    drop.add(i); record["manual"].append(names[i])
-        logging.warning("지정한 순번 제외 (--exclude-frames %s): %d장", exclude_frames, len(record["manual"]))
-    if not drop:
-        return image_dir, None
-    stage = os.path.join(output_dir, "_frames")
-    if os.path.isdir(stage):
-        for f in os.listdir(stage):
-            try: os.remove(os.path.join(stage, f))
-            except OSError: pass
-    os.makedirs(stage, exist_ok=True)
-    for i, p in enumerate(paths):
-        if i not in drop:
-            os.symlink(os.path.realpath(p), os.path.join(stage, names[i]))
-    record.update(source_dir=image_dir, used=len(paths) - len(drop), dropped=len(drop), stage_dir=stage)
-    logging.warning("사진 %d장 중 %d장을 빼고 %d장으로 처리합니다 → %s", len(paths), len(drop), len(paths) - len(drop), stage)
-    return stage, record
-
-
 def parse_args() -> argparse.Namespace:
     def valid_filepath(filepath):
         path = os.path.abspath(os.path.expanduser(filepath))
@@ -260,18 +73,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--glob", dest="glob_pattern", default="*.JPG",
                    help="이미지 글로브 패턴. H20T 는 _T (thermal) 파일이 "
                         "섞이므로 RGB 만 처리하려면 조정할 것")
-    p.add_argument("--drop-transit", dest="drop_transit", action="store_true", default=True,
-                   help="비행 방향이 다른 연속 구간(복귀·이동)을 빼고 처리 (기본 켬). "
-                        "EWP 가운데 이음매를 깨뜨린 주원인")
-    p.add_argument("--keep-transit", dest="drop_transit", action="store_false",
-                   help="비행선 밖 구간을 빼지 않음")
-    p.add_argument("--transit-min-run", type=int, default=3,
-                   help="비행 방향에서 벗어난 이동이 몇 장 이상 이어져야 비행선 밖으로 볼지")
-    p.add_argument("--transit-dev", type=float, default=45.0,
-                   help="주 비행 방향에서 벗어난 각도 기준 (도)")
-    p.add_argument("--exclude-frames", default=None,
-                   help="파일명 순번으로 뺄 사진. 두 비행이면 세션을 붙임 (예: 1:372-395 — 세션은 0부터). "
-                        "비행선 밖 판정과 함께 적용")
     p.add_argument("--epsg", type=int, default=5186,
                    help="출력 좌표계 EPSG (기본: Korea 2000 / Central Belt)")
     p.add_argument("--gsd", type=float, default=None,
@@ -465,11 +266,9 @@ def parse_args() -> argparse.Namespace:
                         "0 이면 기존 동작(차이 영상만 사용)")
     p.add_argument("--force-exposure", dest="thermal_auto",
                    action="store_false",
-                   help="열화상의 노출 보정 자동 해제를 막는다. 노출 보정은 이제 모든 영상에서 "
-                        "기본이 꺼짐이라, 열화상에서 켜려면 --exposure-comp 와 "
-                        "함께 줘야 한다. 열화상은 밝기가 곧 온도라 프레임별 이득이 "
-                        "핫스팟 판정을 바꾼다 (실측 이득 범위 1.31배). "
-                        "기본: 자동 해제 켜짐 (thermal_auto=%(default)s)")
+                   help="열화상에서도 노출 보정을 강제로 사용한다. 기본은 자동 "
+                        "해제 — 열화상은 밝기가 곧 온도라 프레임별 이득이 "
+                        "핫스팟 판정을 바꾼다 (실측 이득 범위 1.31배)")
     p.add_argument("--offnadir-frac", dest="offnadir_frac", type=float,
                    default=0.65,
                    help="연직 제한 자동 조정 비율 (프레임 최대 k 대비). "
@@ -575,18 +374,9 @@ def parse_args() -> argparse.Namespace:
                         "가로지르지 않고 잔디/그림자 쪽으로 흐르게 한다")
     p.add_argument("--seam-cost", dest="seam_cost_weight", type=float,
                    default=1.0, help="시임 최적화 강도 (0.5~2.0)")
-    _exg = p.add_mutually_exclusive_group()
-    _exg.add_argument("--exposure-comp", dest="exposure_compensate",
-                      action="store_true",
-                      help="프레임 간 노출 보정 켜기. 기본은 꺼짐 — 이득 사슬이 길면 "
-                           "상·하한(0.70·1.40)에 붙어 구역마다 밝기가 두 배까지 "
-                           "달라지고, 밝은 반사 프레임을 더 밝혀 포화 얼룩을 만든다 "
-                           "(그린환경 포화 10.1→5.1%%, K_Demo 번진 조각 감소, EWP 조각 "
-                           "경계 밝기 계단 제거). 구름으로 구역별 밝기가 크게 다를 때만")
-    _exg.add_argument("--no-exposure-comp", dest="exposure_compensate",
-                      action="store_false",
-                      help="기본값(꺼짐)과 같음 — 이전 명령과의 호환용")
-    p.set_defaults(exposure_compensate=False)
+    p.add_argument("--no-exposure-comp", dest="exposure_compensate",
+                   action="store_false",
+                   help="프레임 간 노출 보정 비활성화")
     p.add_argument("--glint-penalty", type=float, default=0.7,
                    help="정반사 포화 픽셀 점수 감쇠 (0~1). 0 이면 미사용")
     p.add_argument("--no-auto-plane", dest="auto_plane", action="store_false",
@@ -613,12 +403,6 @@ def main() -> None:
     #   함수가 받지 못하는 인자는 **경고만 하고 떨어뜨린다**. 그러면 새
     #   기능만 빠진 채로 정상 실행된다 — 40분짜리 실행이 인자 하나 때문에
     #   시작도 못 하는 일이 없어진다.
-    _frames_record = None
-    if args.drop_transit or args.exclude_frames:
-        args.image_dir, _frames_record = stage_images(
-            args.image_dir, args.glob_pattern, args.output_dir, args.drop_transit,
-            args.exclude_frames, min_run=args.transit_min_run, dev_deg=args.transit_dev)
-
     _kwargs = dict(
         image_dir=args.image_dir,
         output_dir=args.output_dir,
@@ -768,19 +552,6 @@ def main() -> None:
             _kwargs.pop(k)
 
     summary = run_homography_pipeline(**_kwargs)
-    if _frames_record is not None:
-        # 뺀 사진 기록을 summary.json 에도 남긴다 (나중에 어떤 사진으로 만들었는지 확인용)
-        if isinstance(summary, dict):
-            summary["frame_exclusion"] = _frames_record
-        _sj = os.path.join(args.output_dir, "summary.json")
-        try:
-            with open(_sj, encoding="utf-8") as f:
-                _s = json.load(f)
-            _s["frame_exclusion"] = _frames_record
-            with open(_sj, "w", encoding="utf-8") as f:
-                json.dump(_s, f, indent=2, ensure_ascii=False, default=str)
-        except Exception as _e:
-            logging.warning("summary.json 에 제외 기록을 쓰지 못했습니다: %s", _e)
 
     print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
     _cpu = time.perf_counter() - start

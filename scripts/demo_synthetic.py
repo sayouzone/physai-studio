@@ -21,8 +21,6 @@ import cv2
 import numpy as np
 from pathlib import Path
 
-#sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-#.rgb_ir_fusion
 # 프로젝트를 editable 설치하지 않았을 때를 위해 src 경로 추가.
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "label_studio"))

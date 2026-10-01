@@ -121,6 +121,15 @@ def fit_correction(samples, bp):
                         ", ".join("%+.2f" % g[2] for g in fit),
                         float(np.median([g[2] for g in fit])))
         logger.info("")
+        _edge_n = sum(1 for s_ in samples if len(s_) > 6 and s_[6])
+        if _edge_n * 3 > len(samples):
+            _up = sum(1 for s_ in samples if len(s_) > 6 and s_[6] and s_[2] > 0)
+            logger.info("    ★ 원인은 지점 수가 아니라 **탐색 범위**입니다 — %d/%d곳이"
+                        " 범위 끝(%s)에 붙었습니다.", _edge_n, len(samples),
+                        "위" if _up * 2 >= _edge_n else "아래")
+            logger.info("      --z-min/--z-max 를 그 방향으로 넓혀 다시 재십시오.")
+            logger.info("=" * 66)
+            return
         logger.info("    --starts 를 10곳 이상으로 늘리십시오. 같은 평면에서도")
         logger.info("    지점을 늘리면 신뢰 지점이 늘어납니다 (실측: 6곳→2,")
         logger.info("    10곳→6).")
@@ -156,6 +165,45 @@ def fit_correction(samples, bp):
                     "적합에서 뺐습니다.", len(edge))
         logger.info("    그 지점들은 아직 바닥을 안 지났습니다. "
                     "--z-min/--z-max 를 넓혀 다시 재십시오.")
+        # ★ 범위 끝 지점이 많으면 제외는 해법이 아니라 왜곡이다. 실측
+        #   (K_Demo 열화상): 12곳 중 7곳이 +4.00 m 끝에 붙었고 기복비율이
+        #   전부 1.04~1.09, 어긋남 0.55 → 0.05 m 로 가장 확실한 신호였다.
+        #   그 다수를 빼고 남은 5곳(자유도 2)으로 경사 2.036° 를 적합해
+        #   "부지 전체가 맞습니다, 적용하십시오" 라고 냈다. 신호가 가장
+        #   강한 쪽을 버린 결과다. 범위 끝이 전체의 1/3 을 넘으면 적합·
+        #   권고를 하지 않고 범위를 넓히라고만 한다.
+        n_all = len(samples)
+        # ★ 1/3 '초과'였을 때 12곳 중 4곳(정확히 1/3)이 통과했고, 그 4곳이
+        #   전부 북쪽 — 붙일 경계 띠 — 이라 평면이 한쪽으로 기울었다(EWP 세션 0).
+        #   1/3 '이상'이거나, 경계 지점이 적합 지점 무리의 한쪽에 몰려 있으면
+        #   거부한다.
+        _one_side = False
+        if fit and len(edge) >= 2:
+            fx = np.array([f[0] for f in fit], float); fy = np.array([f[1] for f in fit], float)
+            ex = np.array([e[0] for e in edge], float); ey = np.array([e[1] for e in edge], float)
+            cx0, cy0 = fx.mean(), fy.mean()
+            # 적합 지점 무리의 주축 방향으로 투영해, 경계 지점이 모두 같은 쪽 끝 너머인가
+            _, _, vt = np.linalg.svd(np.column_stack([fx - cx0, fy - cy0]), full_matrices=False)
+            ax = vt[0]
+            pf = (fx - cx0) * ax[0] + (fy - cy0) * ax[1]
+            pe = (ex - cx0) * ax[0] + (ey - cy0) * ax[1]
+            _one_side = bool(np.all(pe > np.percentile(pf, 75)) or np.all(pe < np.percentile(pf, 25)))
+        if len(edge) * 3 >= n_all or _one_side:
+            ends = [float(s_[2]) for s_ in edge]
+            up = sum(1 for e in ends if e > 0)
+            side = "위(+)" if up >= len(ends) - up else "아래(-)"
+            logger.info("")
+            logger.info("  ★★ 범위 끝 지점이 %d/%d곳%s — **적합도 권고도 하지 "
+                        "않습니다.**", len(edge), n_all,
+                        "이고 한쪽에 몰려 있습니다" if _one_side else "으로 1/3 이상입니다")
+            logger.info("     남은 지점만으로 그린 평면은 가장 강한 신호를 "
+                        "뺀 것이라 대표성이 없습니다.")
+            logger.info("     끝에 붙은 방향: %s %d곳 — 그쪽으로 범위를 "
+                        "넓혀 다시 재십시오.", side, max(up, len(ends) - up))
+            logger.info("     (같은 기체의 다른 센서와 기준면이 수 m 다르면 "
+                        "지형보다 초점거리 보정을 의심하십시오.)")
+            logger.info("=" * 66)
+            return
     weak = sum(1 for s_ in samples if s_[5] < 0.6
                and not (len(s_) > 6 and s_[6]))
     if weak:
@@ -382,8 +430,11 @@ def main() -> int:
                 k2, d2 = sift.detectAndCompute(wb, None)
                 if d1 is None or d2 is None:
                     continue
-                good = [x for x, y in bf.knnMatch(d1, d2, k=2)
-                        if x.distance < 0.7 * y.distance]
+                # ★ 갈평저수지 열화상: 한쪽 서술자가 1개뿐인 쌍에서 knnMatch 가
+                #   이웃을 1개만 돌려줘 'expected 2, got 1' 로 전체가 멈췄다.
+                #   이웃이 2개인 것만 비율 검사하고 나머지는 버린다.
+                good = [m[0] for m in bf.knnMatch(d1, d2, k=2)
+                        if len(m) == 2 and m[0].distance < 0.7 * m[1].distance]
                 if len(good) < 60:
                     continue
                 src = np.float32([k1[x.queryIdx].pt for x in good])
