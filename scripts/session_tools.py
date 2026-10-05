@@ -30,6 +30,7 @@ import sys
 from datetime import datetime
 
 import numpy as np
+from pathlib import Path
 
 PAT = re.compile(r"DJI_(\d{14})_(\d{4})")
 
@@ -882,6 +883,222 @@ def cmd_overlay(a):
         print("윤곽 그림 %s" % a.mask_out)
 
 
+def _seam_stats(mosaic_path, labels_path=None, offset_m=None, max_samples=200000, seed=0):
+    """라벨 지도의 경계(이음매)를 가로질러 밝기 단차를 잰다."""
+    import rasterio
+    from rasterio.enums import Resampling
+    mp = Path(mosaic_path)
+    lp = Path(labels_path) if labels_path else mp.with_name(mp.stem + "_labels.tif")
+    if not lp.exists():
+        return None, "라벨 지도 없음 (%s) — 이 기능 이후의 파이프라인으로 다시 만들어야 함" % lp.name
+    L = rasterio.open(lp); lab = L.read(1); rg = abs(L.transform.a)
+    M = rasterio.open(mp)
+    # 모자이크를 라벨 해상도의 절반 격자로 읽음 (라벨 원점과 같음)
+    g2 = rg / 2.0
+    H2 = int(round(lab.shape[0] * 2)); W2 = int(round(lab.shape[1] * 2))
+    from rasterio.vrt import WarpedVRT
+    from rasterio.transform import Affine
+    tr2 = Affine(g2, 0, L.transform.c, 0, -g2, L.transform.f)
+    vr = WarpedVRT(M, crs=L.crs, transform=tr2, width=W2, height=H2, resampling=Resampling.average,
+                   nodata=0, dtype="float32")          # 정수로 평균하면 약한 무늬에서 반올림이 단차 비를 비튼다
+    arr = vr.read().astype(np.float32)
+    valid = np.abs(arr).sum(axis=0) > 0
+    gray = arr[:3].mean(axis=0) if arr.shape[0] >= 3 else arr[0]
+    rgbish = arr.shape[0] >= 3 and float(np.std(arr[0][valid] - arr[2][valid])) > 4.0
+    panel = None
+    if rgbish:
+        r, g, b = arr[0], arr[1], arr[2]
+        panel = valid & (b > r + 12) & (b >= g) & (arr[:3].max(axis=0) < 170)
+    d = max(1, int(round((offset_m or 1.5 * rg) / g2)))       # 경계에서 양쪽으로 떨어진 거리 (반격자 칸)
+    rng = np.random.default_rng(seed)
+    # 경계 칸: 오른쪽 · 아래 이웃과 라벨이 다름 (둘 다 유효)
+    ok = lab >= 0
+    hb = ok[:, :-1] & ok[:, 1:] & (lab[:, :-1] != lab[:, 1:])
+    vb = ok[:-1, :] & ok[1:, :] & (lab[:-1, :] != lab[1:, :])
+    def take(mask, axis):
+        ys, xs = np.nonzero(mask)
+        if len(ys) > max_samples:
+            k = rng.choice(len(ys), max_samples, replace=False); ys, xs = ys[k], xs[k]
+        # 경계 위치(반격자): 가로 경계는 두 칸 사이 x = 2x+1.5 쯤, 세로는 y
+        if axis == 1:
+            cy, cx = 2 * ys + 1, 2 * xs + 2
+            a = (cy, cx - d); b = (cy, cx + d - 1)
+        else:
+            cy, cx = 2 * ys + 2, 2 * xs + 1
+            a = (cy - d, cx); b = (cy + d - 1, cx)
+        inb = (a[0] >= 0) & (a[1] >= 0) & (b[0] < H2) & (b[1] < W2)
+        a = (a[0][inb], a[1][inb]); b = (b[0][inb], b[1][inb]); c = (cy[inb], cx[inb])
+        both = valid[a] & valid[b]
+        step = np.abs(gray[a] - gray[b])[both]
+        onp = panel[(c[0][both], c[1][both])] if panel is not None else None
+        return step, onp
+    s1, p1 = take(hb, 1); s2, p2 = take(vb, 0)
+    seam_step = np.r_[s1, s2]
+    # 비교: 경계가 아닌 곳에서 같은 간격의 밝기 차 (가로 · 세로)
+    inner = ok.copy(); inner[:, :-1] &= ~hb; inner[:, 1:] &= ~hb; inner[:-1, :] &= ~vb; inner[1:, :] &= ~vb
+    ys, xs = np.nonzero(inner)
+    if len(ys) > max_samples:
+        k = rng.choice(len(ys), max_samples, replace=False); ys, xs = ys[k], xs[k]
+    base = []
+    for dy, dx in ((0, 1), (1, 0)):
+        cy, cx = 2 * ys + 1, 2 * xs + 1
+        a = (cy - d * dy, cx - d * dx); b = (cy + d * dy - dy, cx + d * dx - dx)
+        inb = (a[0] >= 0) & (a[1] >= 0) & (b[0] < H2) & (b[1] < W2)
+        a = (a[0][inb], a[1][inb]); b = (b[0][inb], b[1][inb])
+        both = valid[a] & valid[b]
+        base.append(np.abs(gray[a] - gray[b])[both])
+    base = np.concatenate(base)
+    if seam_step.size < 50 or base.size < 50:
+        return None, "표본이 너무 적음"
+    area_m2 = float(ok.sum()) * rg * rg
+    length_m = float(hb.sum() + vb.sum()) * rg
+    bm = float(np.median(base)) + 1e-6
+    out = dict(seam_step_ratio=float(np.median(seam_step)) / bm,
+               strong_step_frac=float(np.mean(seam_step > np.percentile(base, 90))),
+               seam_density_m_per_100m2=100.0 * length_m / max(area_m2, 1e-6),
+               seam_on_panel_frac=(float(np.mean(np.r_[p1, p2])) if panel is not None and (p1 is not None) else None),
+               n_seam=int(seam_step.size), label_gsd_m=rg, frames=int(len(np.unique(lab[ok]))))
+    return out, None
+
+
+def _seam_shift(mosaic_path, labels_path=None, n_samples=3000, along_m=1.6, side_m=0.30, gap_m=0.04,
+                max_shift_m=0.30, seed=0):
+    """이음매 양쪽 띠의 무늬가 경계를 따라 몇 m 밀렸는지 — 기하 어긋남.
+
+    ★ 밝기 단차 비는 갈평 세 결과(base · 2차 안내 매칭 · 호모그래피 검증)를 2.22~2.24 로 구분하지
+      못했다. 같은 사진을 노출 보정 없이 쓰니 경계의 밝기 차는 같다. 눈으로 본 차이는 경계에서
+      패널 줄이 끊기거나 엇나가는 **기하**였다. 경계 양쪽에 경계를 따라 가는 띠를 잡고, 두 띠의
+      밝기 분포를 경계 방향으로 밀어 가며 정규화 상관이 가장 큰 이동을 찾는다.
+    """
+    import rasterio
+    from rasterio.windows import from_bounds
+    mp = Path(mosaic_path); lp = Path(labels_path) if labels_path else mp.with_name(mp.stem + "_labels.tif")
+    if not lp.exists():
+        return None
+    L = rasterio.open(lp); lab = L.read(1); rg = abs(L.transform.a)
+    M = rasterio.open(mp); g = abs(M.transform.a)
+    ok = lab >= 0
+    hb = ok[:, :-1] & ok[:, 1:] & (lab[:, :-1] != lab[:, 1:])          # 좌우로 라벨이 바뀜 → 경계는 세로
+    vb = ok[:-1, :] & ok[1:, :] & (lab[:-1, :] != lab[1:, :])          # 위아래로 바뀜 → 경계는 가로
+    rng = np.random.default_rng(seed)
+    pts = [(*p, 'v') for p in zip(*np.nonzero(hb))] + [(*p, 'h') for p in zip(*np.nonzero(vb))]
+    if not pts:
+        return None
+    pick = rng.choice(len(pts), min(n_samples, len(pts)), replace=False)
+    S = int(round(max_shift_m / g)); shifts = []; n_edge = 0
+    for k in pick:
+        r, c, kind = pts[k]
+        if kind == 'v':
+            X = L.transform.c + (c + 1) * rg; Y = L.transform.f - (r + 0.5) * rg
+            win = from_bounds(X - side_m - gap_m, Y - along_m / 2, X + side_m + gap_m, Y + along_m / 2, M.transform)
+        else:
+            X = L.transform.c + (c + 0.5) * rg; Y = L.transform.f - (r + 1) * rg
+            win = from_bounds(X - along_m / 2, Y - side_m - gap_m, X + along_m / 2, Y + side_m + gap_m, M.transform)
+        try:
+            a = M.read(indexes=list(range(1, min(M.count, 3) + 1)), window=win, boundless=True, fill_value=0).astype(np.float32)
+        except Exception:
+            continue
+        if a.size == 0:
+            continue
+        gray = a.mean(axis=0); valid = np.abs(a).sum(axis=0) > 0
+        if kind == 'h':                                              # 경계 방향을 세로축으로 맞춤
+            gray = gray.T; valid = valid.T
+        H, W = gray.shape
+        if H < 3 * S or W < 6:
+            continue
+        mid = W // 2; gp = max(1, int(round(gap_m / g))); sp = max(2, int(round(side_m / g)))
+        A = gray[:, max(0, mid - gp - sp):mid - gp]; B = gray[:, mid + gp:mid + gp + sp]
+        vA = valid[:, max(0, mid - gp - sp):mid - gp].all(axis=1); vB = valid[:, mid + gp:mid + gp + sp].all(axis=1)
+        if not (vA.all() and vB.all()):
+            continue
+        pa = A.mean(axis=1); pb = B.mean(axis=1)
+        if pa.std() < 4.0 or pb.std() < 4.0:                         # 경계를 가로지르는 무늬가 없음
+            continue
+        # ★ 탐색 범위를 무늬 주기의 45% 안으로 — 한 주기 옆에 상관이 걸리는 일을 구조적으로 막는다.
+        #   Site-2 열화상(GSD 0.05 m)은 상한 0.30 m 가 6 화소뿐이라 표본의 52% 가 끝에 걸렸다.
+        Se = S
+        q = pa - pa.mean(); ac = np.correlate(q, q, mode="full")[len(q) - 1:]
+        ac = ac / (ac[0] + 1e-9)
+        pk = [t for t in range(2, len(ac) - 1) if ac[t] > ac[t - 1] and ac[t] >= ac[t + 1] and ac[t] > 0.3]
+        if pk:
+            Se = max(2, min(S, int(0.45 * pk[0])))
+        core = slice(Se, H - Se); x = pa[core] - pa[core].mean()
+        nccs = []
+        for sft in range(-Se, Se + 1):
+            y = pb[Se + sft:H - Se + sft]; y = y - y.mean()
+            den = np.sqrt((x * x).sum() * (y * y).sum()) + 1e-9
+            nccs.append(float((x * y).sum() / den))
+        nccs = np.array(nccs); kb = int(np.argmax(nccs)); best = float(nccs[kb]); bs = kb - Se
+        if best >= 0.6:
+            # ★ 탐색 끝에 붙은 표본은 측정 실패 (갈평 세 결과의 90% 값이 상한 0.30 m 근처였다)
+            if abs(bs) >= Se - 0 and Se > 1 and (kb == 0 or kb == len(nccs) - 1):
+                n_edge += 1
+            else:
+                # 화소 이하 정밀도 — 최대점 둘레 포물선 (열화상은 0.05 m 단위로만 나오던 것)
+                sub = 0.0
+                if 0 < kb < len(nccs) - 1:
+                    c0, c1, c2 = nccs[kb - 1], nccs[kb], nccs[kb + 1]
+                    den2 = (c0 - 2 * c1 + c2)
+                    if abs(den2) > 1e-9:
+                        sub = float(np.clip(0.5 * (c0 - c2) / den2, -0.5, 0.5))
+                shifts.append(abs(bs + sub) * g)
+    n_all = len(shifts) + n_edge
+    if len(shifts) < 30:
+        return dict(n=len(shifts), edge_frac=(n_edge / n_all if n_all else None))
+    sh = np.array(shifts)
+    rb = np.random.default_rng(1)
+    bt = rb.choice(sh, (500, len(sh)), replace=True)
+    med_ci = np.percentile(np.median(bt, axis=1), [2.5, 97.5])
+    fr_ci = np.percentile(np.mean(bt > 0.05, axis=1), [2.5, 97.5])
+    return dict(n=len(sh), median_m=float(np.median(sh)), p90_m=float(np.percentile(sh, 90)),
+                frac_over_5cm=float(np.mean(sh > 0.05)), median_ci=tuple(map(float, med_ci)),
+                frac_ci=tuple(map(float, fr_ci)), edge_frac=n_edge / n_all,
+                frac_over_2gsd=float(np.mean(sh > 2 * g)), gsd=g)
+
+
+def cmd_seams(a):
+    """라벨 지도로 이음매 자체를 잰다 — 밝기 단차 · 뚜렷한 단차 비율 · 밀도 · 패널 위 비율.
+
+    ★ qc_tear(줄 어긋남)는 갈평 RGB · Site-2 열화상에서 눈으로 나빠진 이음새를
+      '구분되지 않음'으로 냈다. 이음매가 어디를 지나는지(라벨 경계)를 알면 그 자리의
+      밝기 단차를 직접 잴 수 있다.
+    """
+    print("%-22s %7s %9s │ %-22s %-22s %7s %8s %6s %7s" % ("결과", "단차 비", "뚜렷한단차",
+                                                      "어긋남 중앙값 (95%)", ">5cm (95%)", ">2GSD", "어긋남90", "표본", "끝 걸림"))
+    first = None
+    for mp in a.mosaics:
+        r, why = _seam_stats(mp, offset_m=a.offset_m)
+        name = Path(mp).parent.name
+        if r is None:
+            print("%-24s %s" % (name, why)); continue
+        gsh = _seam_shift(mp, n_samples=a.samples) or {}
+        if "median_m" in gsh:
+            mark = ""
+            if first is None:
+                first = gsh
+            else:
+                def _ov(k):
+                    return not (gsh[k][1] < first[k][0] or gsh[k][0] > first[k][1])
+                # ★ 중앙값 구간 또는 비율 구간 중 하나라도 겹치지 않으면 구분된다 (갈평: gal_h 와 gal_gm6 는
+                #   중앙값 구간이 0.052~0.065 대 0.033~0.045 로 갈렸는데 비율만 보아 '구분 안 됨'으로 냈다)
+                if _ov("median_ci") and _ov("frac_ci"):
+                    mark = "  ← 첫 결과와 구분 안 됨"
+                else:
+                    mark = "  ← 첫 결과보다 나쁨" if gsh["median_m"] > first["median_m"] else "  ← 첫 결과보다 좋음"
+            geo = "%.3f (%.3f~%.3f)    %4.1f%% (%4.1f~%4.1f%%) %7.1f%% %8.3f %6d %6.0f%%%s" % (
+                gsh["median_m"], gsh["median_ci"][0], gsh["median_ci"][1], 100 * gsh["frac_over_5cm"],
+                100 * gsh["frac_ci"][0], 100 * gsh["frac_ci"][1], 100 * gsh["frac_over_2gsd"],
+                gsh["p90_m"], gsh["n"], 100 * gsh["edge_frac"], mark)
+        else:
+            geo = "표본 부족 (%d)" % gsh.get("n", 0)
+        print("%-22s %7.2f %8.1f%% │ %s" % (name, r["seam_step_ratio"], 100 * r["strong_step_frac"], geo))
+    print()
+    print("끝 걸림: 탐색 상한에 상관이 걸린 표본(반복 줄 한 주기 옆) — 어긋남 계산에서 뺌")
+    print("어긋남: 이음매 양쪽 띠의 무늬가 경계를 따라 밀린 거리 m (중앙값 · 90%) 와 5 cm 넘는 비율 — 기하")
+    print("단차 비: 이음매를 가로지른 밝기 차 ÷ 이음매 아닌 곳의 같은 간격 밝기 차 (1 이면 이음매가 안 보임)")
+    print("뚜렷한 단차: 이음매 단차 중 '이음매 아닌 곳' 상위 10% 를 넘는 비율 (10% 이면 구분 안 됨)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -949,6 +1166,10 @@ def main():
     p.add_argument("--min-frames", type=int, default=5, help="옥상으로 볼 최소 프레임 수 (기본 5)")
     p.add_argument("--buffer", type=float, default=4.0, help="윤곽을 둘레로 넓히는 폭 m (기본 4)")
     p.add_argument("--out", required=True); p.add_argument("--mask-out", default=None, help="윤곽 그림 png")
+    p = sp.add_parser("seams"); p.set_defaults(f=cmd_seams)
+    p.add_argument("--mosaics", nargs="+", required=True, help="mosaic.tif 들 (옆에 mosaic_labels.tif 가 있어야 함)")
+    p.add_argument("--offset-m", type=float, default=None, help="이음매에서 양쪽으로 떨어진 거리 m (기본 라벨 칸의 1.5배)")
+    p.add_argument("--samples", type=int, default=3000, help="기하 어긋남을 잴 경계 표본 수 (기본 3000)")
     p = sp.add_parser("empty"); p.set_defaults(f=cmd_empty)
     p.add_argument("--cameras", required=True, help="궤적을 정할 cameras.npz")
     p.add_argument("--mosaics", nargs="+", required=True)

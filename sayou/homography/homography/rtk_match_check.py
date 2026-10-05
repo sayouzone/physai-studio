@@ -169,8 +169,7 @@ def choose_prediction_plane(zxy, cam_center_xy, *, env=None):
     zxy : [(x, y, 지면 z)] — 레이저로 지면 높이를 구한 프레임들의 카메라 위치.
     cam_center_xy : 카메라 중심 (지정 기준면의 원점이 이 부지 것인지 검사).
     env : 환경변수 사전 (시험용). 기본은 os.environ.
-        SAYOU_RTK_CHECK_PLANE — 기본 horizontal(예전 동작). auto 면 지정 기준면 →
-        레이저 지면 평면 → 수평면 순으로 고른다.
+        SAYOU_RTK_CHECK_PLANE=horizontal 이면 예전처럼 수평면을 강제한다.
 
     Returns ``(GroundPlane, info)``.
     """
@@ -180,13 +179,7 @@ def choose_prediction_plane(zxy, cam_center_xy, *, env=None):
     zs = np.array([z for _, _, z in zxy], dtype=float) if zxy else np.array([])
     z0 = float(np.median(zs)) if zs.size else 0.0
     horiz = GroundPlane.horizontal(z0)
-    # ★ 기본은 예전 동작(수평면). Site-2-29719 열화상에서 지정 기준면으로 예측하자
-    #   예측 차이 중앙값 41 → 42 px 로 그대로인데 기각 쌍 121 → 156, tie point 없는
-    #   프레임 5 → 20 으로 나빠졌다. 예측 차이의 대부분이 지형이 아니라 **옥상 시차**
-    #   (땅 +13~18 m, 기선 8 m 에서 약 45 px)였고, 수평면(레이저 중앙값, 옥상 섞임)이
-    #   우연히 옥상 쪽에 가까웠다. 평면 하나로 예측하는 쌍 검사는 여러 층 부지에 맞지
-    #   않는다. 평지 부지(EWP)에서 확인될 때까지 새 선택은 auto 로 켤 때만 쓴다.
-    mode = str(env.get("SAYOU_RTK_CHECK_PLANE", "horizontal")).strip().lower()
+    mode = str(env.get("SAYOU_RTK_CHECK_PLANE", "auto")).strip().lower()
     cx, cy = float(cam_center_xy[0]), float(cam_center_xy[1])
 
     def _out(pl, src, **kw):
@@ -196,7 +189,7 @@ def choose_prediction_plane(zxy, cam_center_xy, *, env=None):
         info.update(kw)
         logger.info("RTK 쌍 검사 예측 평면: %s (경사 %.2f°, 카메라 중심 표고 %.2f m)%s",
                     {"override": "지정 기준면", "lrf_fit": "레이저 지면 평면",
-                     "horizontal": "수평면", "horizontal_forced": "수평면 (기본 — 새 선택은 SAYOU_RTK_CHECK_PLANE=auto)"}[src],
+                     "horizontal": "수평면", "horizontal_forced": "수평면 (SAYOU_RTK_CHECK_PLANE=horizontal)"}[src],
                     info["slope_deg"], info["z_at_center"],
                     ("  — %s" % kw["note"]) if kw.get("note") else "")
         return pl, info
@@ -204,8 +197,21 @@ def choose_prediction_plane(zxy, cam_center_xy, *, env=None):
     if mode == "horizontal":
         return _out(horiz, "horizontal_forced")
 
-    # 레이저 지면 평면 — 옥상 · 나무 같은 이상치를 깎아 가며 적합 (먼저 구해 둠)
-    lrf = None
+    # 1) 지정 기준면 — 원점이 이 부지 것일 때만 (다른 부지 값이 셸에 남은 경우 차단)
+    ov = str(env.get("SAYOU_PLANE_OVERRIDE", "") or "").strip()
+    note = ""
+    if ov:
+        try:
+            v = [float(t) for t in ov.replace(" ", "").split(",")]
+            if len(v) == 5:
+                dz = v[0] * (cx - v[3]) + v[1] * (cy - v[4])
+                if abs(dz) <= 2.0:
+                    return _out(GroundPlane(a=v[0], b=v[1], c=v[2], origin_xy=(v[3], v[4])), "override")
+                note = "지정 기준면 원점이 카메라 중심에서 표고차 %+.1f m — 다른 부지 값으로 보고 쓰지 않음" % dz
+        except ValueError:
+            note = "SAYOU_PLANE_OVERRIDE 를 읽지 못함"
+
+    # 2) 레이저 지면 평면 — 옥상 · 나무 같은 이상치를 깎아 가며 적합
     if zs.size >= 10:
         P = np.array([(x, y) for x, y, _ in zxy], dtype=float)
         x0, y0 = float(np.median(P[:, 0])), float(np.median(P[:, 1]))
@@ -224,37 +230,8 @@ def choose_prediction_plane(zxy, cam_center_xy, *, env=None):
             rms_fit = float(np.sqrt(np.mean(r[keep] ** 2)))
             rms_h = float(np.sqrt(np.mean((zs[keep] - np.median(zs[keep])) ** 2)))
             slope = float(np.degrees(np.arctan(np.hypot(coef[0], coef[1]))))
-            lrf = dict(plane=GroundPlane(a=float(coef[0]), b=float(coef[1]), c=float(coef[2]), origin_xy=(x0, y0)),
-                       usable=bool(slope > 0.5 and rms_fit < 0.8 * rms_h),
-                       rms_m=rms_fit, rms_horizontal_m=rms_h, frames=int(keep.sum()))
-
-    # 1) 지정 기준면 — 이 부지 것이고, 지면과 같은 층일 때만
-    #   ★ 원점이 다른 부지면(다른 부지 값이 셸에 남음) 쓰지 않는다.
-    #   ★ 옥상 기준면처럼 지면과 다른 층이면 쓰지 않는다. 열화상 · RGB 프레임의 대부분은
-    #     땅을 찍으므로, 옥상 평면(Site-2: 땅 +17 m)으로 예측하면 땅의 대응을 크게 틀린다.
-    ov = str(env.get("SAYOU_PLANE_OVERRIDE", "") or "").strip()
-    note = ""
-    if ov:
-        try:
-            v = [float(t) for t in ov.replace(" ", "").split(",")]
-            if len(v) == 5:
-                opl = GroundPlane(a=v[0], b=v[1], c=v[2], origin_xy=(v[3], v[4]))
-                dz = v[0] * (cx - v[3]) + v[1] * (cy - v[4])
-                if abs(dz) > 2.0:
-                    note = "지정 기준면 원점이 카메라 중심에서 표고차 %+.1f m — 다른 부지 값으로 보고 쓰지 않음" % dz
-                else:
-                    ref = lrf["plane"] if lrf else horiz
-                    gap = float(opl.height_at(cx, cy) - ref.height_at(cx, cy))
-                    if zs.size >= 10 and abs(gap) > 5.0:
-                        note = ("지정 기준면이 레이저 지면보다 %+.1f m — 옥상 등 다른 층의 기준면으로 보고 "
-                                "예측에 쓰지 않음" % gap)
-                    else:
-                        return _out(opl, "override", gap_to_lrf_m=gap)
-        except ValueError:
-            note = "SAYOU_PLANE_OVERRIDE 를 읽지 못함"
-
-    # 2) 레이저 지면 평면
-    if lrf and lrf["usable"]:
-        return _out(lrf["plane"], "lrf_fit", rms_m=lrf["rms_m"], rms_horizontal_m=lrf["rms_horizontal_m"],
-                    frames=lrf["frames"], note=note)
+            if slope > 0.5 and rms_fit < 0.8 * rms_h:
+                pl = GroundPlane(a=float(coef[0]), b=float(coef[1]), c=float(coef[2]), origin_xy=(x0, y0))
+                return _out(pl, "lrf_fit", rms_m=rms_fit, rms_horizontal_m=rms_h,
+                            frames=int(keep.sum()), note=note)
     return _out(horiz, "horizontal", note=note)

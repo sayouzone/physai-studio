@@ -239,11 +239,6 @@ def _diagnose_metadata(metas) -> None:
 # ---------------------------------------------------------------------------
 # 메인
 # ---------------------------------------------------------------------------
-def _os_env():
-    import os as _o
-    return dict(_o.environ)
-
-
 def run_homography_pipeline(image_dir: Path,
                  output_dir: Path,
                  target_epsg: int = 5186,
@@ -251,8 +246,6 @@ def run_homography_pipeline(image_dir: Path,
                  device: str = "mps",
                  k_neighbors: int = 8,
                  rtk_match_check: bool = False,
-                 guided_rematch: bool = False,
-                 guided_radius_px: float = 0.0,
                  rtk_check_frac: float = 0.5,
                  stripe_pitch_px: float = 0.0,
                  geoid_undulation_m: float = 0.0,
@@ -478,7 +471,6 @@ def run_homography_pipeline(image_dir: Path,
     focal_info = None
     terrain_info = None
     match_check_info = None
-    guided_info = None
     match_diag = None
     excluded_weak_frames = 0
     distortion_info = None
@@ -710,8 +702,6 @@ def run_homography_pipeline(image_dir: Path,
 
 
             cams_cur = initial_cameras
-            _guided_done = False
-            _undist_hist = []          # 왜곡 보정 기록 — 2차 매칭으로 새로 만든 트랙에도 같은 보정을 건다
             si = -1
             while True:
                 si += 1
@@ -864,7 +854,6 @@ def run_homography_pipeline(image_dir: Path,
                             f_rep, cx_rep, cy_rep)
                         if dres is not None:
                             k1d, k2d, dinfo = dres
-                            _undist_hist.append((k1d, k2d, f_rep, cx_rep, cy_rep))
                             dist_rounds += 1
                             distortion_info = dinfo
                             tracks = [
@@ -1021,78 +1010,6 @@ def run_homography_pipeline(image_dir: Path,
                                 "  보정된 f 로 느슨한 단계를 다시 실행합니다 "
                                 "(게이트 %.0f px) — 정밀 단계로 바로 가면 "
                                 "점을 전부 잃습니다.", loose_px)
-                # ---- 2차 안내 매칭 (--guided-rematch) -------------------------
-                # ★ 짐벌 자세 예측은 35~41 px 틀려(EWP · Site-2 열화상) 안내 매칭이
-                #   성립하지 않았다. 마지막 정밀 단계가 끝난 지금의 자세로 쌍마다
-                #   국소 평면 · 측정 예측오차 기반 반경으로 다시 매칭하고, 1차 대응에
-                #   더해 정밀 단계를 한 번 더 돈다. 뒤에 남은 단계(왜곡 · 초점 재실행)가
-                #   있으면 그것이 끝날 때까지 기다린다.
-                if (guided_rematch and not _guided_done and si == len(stages) - 1
-                        and pts_opt is not None and len(pts_opt) >= 20):
-                    _guided_done = True
-                    try:
-                        from .homography.guided_match import (
-                            guided_rematch as _grm, merge_matches as _mm,
-                            fit_points_plane as _fpp)
-                        _tg = time.perf_counter()
-                        _gpl = _fpp(pts_opt) or GroundPlane.horizontal(
-                            float(np.median(np.asarray(pts_opt)[:, 2])))
-                        _weak = np.nonzero(obs_cnt == 0)[0]
-                        # 지정 기준면 — 지면과 같은 층이면 예측 후보로 넘긴다 (옥상 기준면은 제외)
-                        _ref = None
-                        try:
-                            from .homography.rtk_match_check import choose_prediction_plane as _cpp
-                            _zxy2 = [(float(cams_cur[_i2, 0]), float(cams_cur[_i2, 1]), float(_z2))
-                                     for _i2, _m2 in enumerate(metas)
-                                     if (_z2 := estimate_ground_z(_m2)) is not None]
-                            _rp, _rinfo = _cpp(_zxy2, (float(np.median(cams_cur[:, 0])),
-                                                       float(np.median(cams_cur[:, 1]))),
-                                               env={**_os_env(), "SAYOU_RTK_CHECK_PLANE": "auto"})
-                            if _rinfo.get("source") == "override":
-                                _ref = _rp
-                        except Exception as _e2:
-                            logger.debug("2차 안내 매칭: 지정 기준면을 읽지 못함 (%s)", _e2)
-                        _gm, _ginfo = _grm(
-                            pairs, features, matches, cams_cur, intrinsics_obj,
-                            observations, pts_opt, global_plane=_gpl,
-                            rot_fn=_rotation_from_opk, weak_frames=_weak,
-                            fixed_radius_px=float(guided_radius_px or 0.0),
-                            reference_plane=_ref,
-                            ba_intrinsics=(f_rep, cx_rep, cy_rep))
-                        _merged, _added, _newp = _mm(matches, _gm)
-                        _ginfo.update(matches_added=int(_added), pairs_new=int(_newp),
-                                      pairs_before=len(matches), pairs_after=len(_merged),
-                                      zero_frames_before=int((obs_cnt == 0).sum()),
-                                      seconds=round(time.perf_counter() - _tg, 1))
-                        logger.info(
-                            "2차 안내 매칭: %d쌍 중 %d쌍 성공, 대응 %d개 추가 (새로 이어진 쌍 %d), "
-                            "예측오차 중앙값 %.1f px → 반경 중앙값 %.1f px, 국소 평면 %d쌍 — %s",
-                            _ginfo["pairs_tried"], _ginfo["pairs_ok"], _added, _newp,
-                            _ginfo["pred_err_median_px"], _ginfo["radius_median_px"] or 0.0,
-                            _ginfo["local_plane_pairs"],
-                            fmt_elapsed(time.perf_counter() - _tg))
-                        logger.info("  예측 방식 (쌍마다 1차 대응으로 고름): %s → 부지 기본 %s",
-                                    _ginfo.get("prediction_mode_votes"), _ginfo.get("prediction_mode_site"))
-                        if _ginfo.get("model_consistency"):
-                            logger.info("  모델 일치 (번들조정 점을 호모그래피로 투영한 오차): %s",
-                                        _ginfo["model_consistency"])
-                        if _added > 0:
-                            _nt = build_tracks(_merged, features,
-                                               min_track_len=2, max_track_len=30)
-                            if _undist_hist:
-                                from .homography.distortion import undistort_observations as _uo
-                                for (_k1, _k2, _f, _cx, _cy) in _undist_hist:
-                                    _nt = [[(ci, ki, *_uo([(0, 0, np.array([px_, py_]))],
-                                                          _k1, _k2, _f, _cx, _cy)[0][2])
-                                            for ci, ki, px_, py_ in tk] for tk in _nt]
-                            logger.info("  트랙 %d → %d개. 정밀 단계를 한 번 더 돌립니다.",
-                                        len(tracks), len(_nt))
-                            tracks = _nt
-                            matches = _merged
-                            stages.insert(si + 1, ("안내매칭 후(정밀)", gate_px, ang))
-                        guided_info = _ginfo
-                    except Exception as _exc:
-                        logger.warning("2차 안내 매칭 실패 (기존 결과 유지): %s", _exc)
                 obs_cnt_final = obs_cnt.copy()
                 # [sayou-patch] 관측 영상좌표를 남긴다. 개수만으로는 구경문제
                 #   (도로 위 프레임의 대응이 한 직선에만 몰리는 것) 를 볼 수
@@ -1112,22 +1029,6 @@ def run_homography_pipeline(image_dir: Path,
                     "zero_frames": int((obs_cnt == 0).sum()),
                     "total_points": int(len(initial_points)),
                 }
-
-    # ★ 블록 연결이 약하면 2차 안내 매칭을 권한다 — 갈평저수지 RGB(줌, 비행선 교차 매칭 2%)는
-    #   tie point 없는 프레임이 81/244 장이었고, --guided-rematch 로 10장이 됐다.
-    #   EWP 열화상(교차 매칭이 충분)에서는 결과가 같았으니 기본으로 켜지는 않는다.
-    try:
-        _md = match_diag if isinstance(match_diag, dict) else {}
-        _cr = _md.get("cross_line_rate")
-        _zf = int((obs_stats or {}).get("zero_frames", 0))
-        _nf = max(len(metas), 1)
-        if not guided_rematch and ((_cr is not None and float(_cr) < 0.10) or _zf > 0.10 * _nf):
-            logger.warning(
-                "★ 블록 연결이 약합니다 — 비행선 교차 매칭 %s, tie point 없는 프레임 %d/%d장. "
-                "--guided-rematch 를 권합니다 (갈평저수지 RGB: tie point 없는 프레임 81 → 10).",
-                "%.0f%%" % (100 * float(_cr)) if _cr is not None else "?", _zf, _nf)
-    except Exception as _e3:
-        logger.debug("안내 매칭 권고 판정 실패: %s", _e3)
 
     # ---- 7. 지상평면 + 호모그래피 ---------------------------------------
     t0 = time.perf_counter()
@@ -1735,7 +1636,6 @@ def run_homography_pipeline(image_dir: Path,
         "pose_transfer": pose_transfer_info,
         "attitude_smoothing": attitude_smooth_info,
         "rtk_match_check": match_check_info,
-        "guided_rematch": guided_info,
         "match_diagnosis": match_diag,
         "excluded_weak_frames": excluded_weak_frames,
         "distortion": distortion_info,

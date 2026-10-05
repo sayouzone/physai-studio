@@ -121,23 +121,8 @@ def detect_transit(names, lat, lon, min_run=3, dev_deg=45.0, cross_factor=1.5):
         if dv > dev_deg: off.update((i, i + 1))
         else: on_v.extend((v[i], v[i + 1]))
     # 비행선 간격: 비행 방향 이동의 수직 좌표를 1.5 m 안에서 묶은 줄 중심의 간격 중앙값
-    # ★ 비행선 간격은 **줄(비행 방향으로 이어진 구간)마다 수직 좌표 중앙값 하나**로 잰다.
-    #   예전에는 비행 방향 이동의 모든 점을 1.5 m 안에서 묶었는데, 갈평 줌 비행처럼 줄 안에서
-    #   옆으로 흔들리면 한 줄이 여러 조각으로 갈라져 간격이 2.2 m (실제 15.6 m)로 나왔고,
-    #   문턱이 3.3 m 가 되어 줄 끝 선회(12 m) 아홉 곳 27장이 복귀 구간으로 빠졌다.
-    legs, run = [], []
-    for k, (i, a_) in enumerate(moves):
-        dv_ = abs(((_math.degrees(a_ - h)) + 90) % 180 - 90)
-        ok_ = dv_ <= 20.0
-        if ok_ and run and moves[k - 1][0] == i - 1 and sess[i] == sess[run[-1]]:
-            run.append(i + 1)
-        else:
-            if len(run) >= 5: legs.append(run)
-            run = [i, i + 1] if ok_ else []
-    if len(run) >= 5: legs.append(run)
-    leg_v = sorted(sorted(v[t] for t in r)[len(r) // 2] for r in legs)
-    lines = []; cur = []
-    for val in (leg_v if len(leg_v) >= 2 else on_v):
+    on_v.sort(); lines = []; cur = []
+    for val in on_v:
         if cur and val - cur[-1] > 1.5: lines.append(sum(cur) / len(cur)); cur = []
         cur.append(val)
     if cur: lines.append(sum(cur) / len(cur))
@@ -154,9 +139,7 @@ def detect_transit(names, lat, lon, min_run=3, dev_deg=45.0, cross_factor=1.5):
     out = []
     for r in runs:
         cross = abs(v[r[-1]] - v[r[0]])
-        # ★ 하한 20 m — 간격을 잘못 재도(갈평 2.2 m) 줄 끝 선회(한 칸, 5~16 m)는 걸리지 않게.
-        #   EWP 복귀 구간은 110 m 를 가로질러 그대로 잡힌다.
-        if cross > max(cross_factor * spacing if spacing else 0.0, 20.0):
+        if spacing is None or cross > cross_factor * spacing:
             out.append((r[0], r[-1], len(r), cross))
     return out, (_math.degrees(h) % 180), spacing
 
@@ -430,12 +413,6 @@ def parse_args() -> argparse.Namespace:
                         "옆 줄을 같은 줄로 착각하는데, 그 오매칭은 기하학적으로 "
                         "자기일관적이라 RANSAC·BA 가 못 거른다 (실측 10쌍 중 "
                         "7쌍이 주기의 정수배로 어긋남)")
-    p.add_argument("--guided-rematch", dest="guided_rematch", action="store_true",
-                   help="번들조정을 마친 자세로 2차 안내 매칭을 한 뒤 정밀 단계를 한 번 더 돈다. "
-                        "쌍마다 국소 평면 · 측정한 예측오차 × 3 을 반경으로 써서 반복 패널 셀을 "
-                        "가른다 (기본 끔)")
-    p.add_argument("--guided-radius-px", dest="guided_radius_px", type=float, default=0.0,
-                   help="2차 안내 매칭 반경을 고정 (px). 0 이면 쌍마다 예측오차로 자동")
     p.add_argument("--rtk-check-frac", dest="rtk_check_frac", type=float,
                    default=0.5,
                    help="줄무늬 주기의 몇 배 이상 어긋나면 기각할지. 0.5 면 "
@@ -718,8 +695,6 @@ def main() -> None:
         two_layer_min_area_m2=args.two_layer_min_area_m2,
         dsm_cell_m=args.dsm_cell_m,
         glob_pattern=args.glob_pattern,
-        guided_rematch=args.guided_rematch,
-        guided_radius_px=args.guided_radius_px,
     )
 
     import inspect
@@ -735,8 +710,7 @@ def main() -> None:
                  "panel_unit_m", "seam_panel_penalty", "terrain_fit",
                  "pose_from",
                  "rtk_match_check",
-                 "plane_shift_limit_m", "plane_lrf_tolerance_m",
-                 "guided_rematch", "guided_radius_px"]
+                 "plane_shift_limit_m", "plane_lrf_tolerance_m"]
         for _k in _need:
             print(f"  pipeline.py  {_k:24} "
                   f"{'있음' if _k in _accepted else '없음 ← 갱신 필요'}")

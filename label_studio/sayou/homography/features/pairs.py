@@ -120,6 +120,57 @@ def _safe_find_fundamental(pts_i: np.ndarray, pts_j: np.ndarray) -> np.ndarray |
     return mask.ravel().astype(bool)
 
 
+def _pair_model() -> str:
+    import os
+    m = os.environ.get("SAYOU_PAIR_MODEL", "fundamental").strip().lower()
+    return m if m in ("fundamental", "homography", "both") else "fundamental"
+
+
+def _safe_find_homography(pts_i: np.ndarray, pts_j: np.ndarray, img_shape=None) -> np.ndarray | None:
+    """호모그래피 RANSAC 으로 대응을 거른다 (USAC MAGSAC++ 가 있으면 그것).
+
+    ★ 갈평저수지 RGB(줌, 물 위 반복 패널)에서 F RANSAC 을 통과한 1차 대응의 상당수가 틀렸다
+      — 번들조정 점은 호모그래피로 1.9 px 안에 투영되는데, 같은 자세로 1차 대응을 예측하면
+      잘 묶인 쌍에서도 723 px 어긋났다. F 는 '대응점이 에피폴라 선 위에 있는가'만 본다.
+      같은 비행선 안의 쌍은 에피폴라 선이 비행 방향이고 패널 줄도 비행 방향이라, 줄을 따라
+      한 모듈 밀린 틀린 대응이 선 위에 정확히 놓여 F 로는 원리적으로 걸러지지 않는다.
+      호모그래피는 '정해진 한 점에 오는가'를 보므로 그런 대응을 거른다.
+    문턱은 패널 높이 차(약 1.5 m)의 시차를 감안해 영상 긴 변의 0.5% (3~25 px).
+      0.4% 에서는 줌(긴 변 5,184 px, 문턱 20.7 px)이 패널 상면 시차(약 23 px)의 맞는 대응을 버렸다.
+    """
+    if pts_i is None or pts_j is None or len(pts_i) < _MIN_POINTS_FOR_F_MATRIX:
+        return None
+    if img_shape is not None:
+        thr = float(np.clip(0.005 * max(img_shape[:2]), 3.0, 25.0))
+    else:
+        span = float(max(np.ptp(pts_i[:, 0]), np.ptp(pts_i[:, 1]), 1.0))
+        thr = float(np.clip(0.005 * span, 3.0, 25.0))
+    method = getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)
+    try:
+        H, mask = cv2.findHomography(np.asarray(pts_i, np.float32), np.asarray(pts_j, np.float32),
+                                     method, thr, maxIters=5000, confidence=0.999)
+    except cv2.error as e:
+        logger.debug("findHomography 실패: %s", e)
+        return None
+    if H is None or mask is None:
+        return None
+    return mask.ravel().astype(bool)
+
+
+def _verify_pair(pts_i: np.ndarray, pts_j: np.ndarray, img_shape=None) -> np.ndarray | None:
+    """SAYOU_PAIR_MODEL 에 따라 쌍의 대응을 거른다 (기본 fundamental = 예전 동작)."""
+    m = _pair_model()
+    if m == "fundamental":
+        return _safe_find_fundamental(pts_i, pts_j)
+    h = _safe_find_homography(pts_i, pts_j, img_shape)
+    if m == "homography":
+        return h
+    f = _safe_find_fundamental(pts_i, pts_j)
+    if h is None or f is None:
+        return None
+    return h & f
+
+
 def _collect_needed_indices(pairs: Iterable[tuple[int, int]]) -> list[int]:
     """
     이미지 쌍 리스트에서 등장하는 모든 고유 이미지 인덱스를 수집.
@@ -222,7 +273,7 @@ def build_tie_points(metas: list[ImageMetadata],
         idx_j = np.array([m.trainIdx for m in good], dtype=np.int64)
 
         # RANSAC (방어된 wrapper 사용).
-        inliers = _safe_find_fundamental(pts_i, pts_j)
+        inliers = _verify_pair(pts_i, pts_j, features[i][2] if len(features[i]) > 2 else None)
         if inliers is None:
             dropped_ransac += 1
             continue

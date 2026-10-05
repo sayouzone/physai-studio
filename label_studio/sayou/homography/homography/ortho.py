@@ -780,6 +780,40 @@ def _coarse_reference(frames, image_paths, order, bounds, cfg,
     return gains, label, g, canvas, filled, smalls
 
 
+_FF_CACHE = {}
+
+
+def _apply_flatfield(im):
+    """SAYOU_FLATFIELD 가 주어지면 영상을 그 분포로 나눈다 (분포는 가운데 = 1 로 정규화된 2차원 배열)."""
+    import os
+    path = os.environ.get("SAYOU_FLATFIELD", "").strip()
+    if not path or im is None or im.ndim < 2:
+        return im
+    key = (path, im.shape[0], im.shape[1])
+    ff = _FF_CACHE.get(key)
+    if ff is None:
+        try:
+            base = np.load(path).astype(np.float32)
+        except Exception as e:                      # pragma: no cover
+            logger.warning("SAYOU_FLATFIELD 를 읽지 못했습니다 (%s) — 평탄화 없이 진행", e)
+            _FF_CACHE[key] = False
+            return im
+        ff = cv2.resize(base, (im.shape[1], im.shape[0]), interpolation=cv2.INTER_LINEAR)
+        ff = np.clip(ff, 0.5, 2.0)
+        _FF_CACHE[key] = ff
+        logger.info("반경 밝기 평탄화 적용: %s (분포 %.3f~%.3f)", os.path.basename(path), float(ff.min()), float(ff.max()))
+    if ff is False:
+        return im
+    dt = im.dtype
+    if im.ndim == 3:
+        out = im.astype(np.float32)
+        out[..., :3] = out[..., :3] / ff[..., None]
+    else:
+        out = im.astype(np.float32) / ff
+    hi = 255 if dt == np.uint8 else (65535 if dt == np.uint16 else None)
+    return np.clip(out, 0, hi).astype(dt) if hi else out.astype(dt)
+
+
 def mosaic_frames(frames: list[FrameHomography],
                   image_paths: list[str | Path],
                   output_path: str | Path,
@@ -901,11 +935,30 @@ def mosaic_frames(frames: list[FrameHomography],
     #   (b) 배정 단위를 패널 모듈로 올리면 한 모듈이 통째로 한 프레임에서
     #       오므로 **모듈이 찢어질 수 없다.** 이쪽이 근본적이다.
     _panel_unit_info = None
+    _panel_mask_save = None
     if ((cfg.seam_panel_penalty > 0 or cfg.panel_unit_m > 0)
             and coarse_img is not None and coarse_ok is not None):
         try:
             from .two_layer import segment_panels
             pm = segment_panels(coarse_img, coarse_ok, ref_gsd)
+            # ★ 밝기 Otsu 에 두 방향 격자 주기를 더한다 (SAYOU_PANEL_PERIODIC=0 이면 예전처럼 Otsu 만)
+            # ★ 기본 auto: 밝기 판정이 부지의 60% 를 넘을 때만 격자 주기로 거른다.
+            #   Site-1 (밝기 72.5%) 은 걸러야 도로 · 옥상 네모 블록이 사라졌고 기하는 같았다.
+            #   갈평 · EWP (46%) 는 밝기 판정이 패널을 대체로 잡고 있었고, 걸렀더니 수상 단지
+            #   일부를 놓쳐 이음매 어긋남이 0.020 → 0.036 m (갈평) 로 나빠졌다.
+            import os as _os2
+            _mode = _os2.environ.get("SAYOU_PANEL_PERIODIC", "auto").strip().lower()
+            _f0 = float(pm[coarse_ok].mean()) if coarse_ok.any() else 0.0
+            if _mode == "1" or (_mode == "auto" and _f0 > 0.60):
+                from .two_layer import periodic_panel_mask
+                pm = pm & periodic_panel_mask(coarse_img, coarse_ok, ref_gsd)
+                logger.info("패널 판정: 밝기만 %.1f%% → 격자 주기까지 %.1f%% (%s)", _f0 * 100,
+                            (float(pm[coarse_ok].mean()) if coarse_ok.any() else 0.0) * 100,
+                            "강제" if _mode == "1" else "밝기 판정이 60% 를 넘어 자동 적용")
+            else:
+                logger.info("패널 판정: 밝기만 %.1f%% — 격자 주기 거르기 %s", _f0 * 100,
+                            "꺼짐 (SAYOU_PANEL_PERIODIC=0)" if _mode == "0" else "생략 (60% 이하)")
+            _panel_mask_save = pm            # 라벨 지도 옆에 저장 — 단위 배정이 어디에 적용됐는지 확인용
             frac = float(pm[coarse_ok].mean()) if coarse_ok.any() else 0.0
             if not (0.05 < frac < 0.90):
                 logger.info("패널 분할 결과가 타당 범위를 벗어나 "
@@ -974,6 +1027,12 @@ def mosaic_frames(frames: list[FrameHomography],
 
     def _decode(idx):
         im = cv2.imread(str(image_paths[idx]), cv2.IMREAD_UNCHANGED)
+        # ★ 반경 밝기 평탄화 (SAYOU_FLATFIELD=분포.npy) — 모자이크 색에만 적용, 매칭 · 번들조정은 원본 그대로.
+        #   Site-1 RGB: 사진 가장자리가 가운데보다 최대 10% 밝아(유리 반사 · 감광 과보정) 이웃 모듈을
+        #   다른 프레임의 다른 자리에서 가져올 때 밝기 계단이 생겼다. 프레임 이득(노출 보정)으로는 안 고쳐짐.
+        #   사진 파일에 구워 넣으면 메타데이터가 달라져 매칭이 무너졌다(재투영 50 px).
+        if im is not None:
+            im = _apply_flatfield(im)
         if im is not None:
             if im.ndim == 3 and im.shape[2] >= 3:
                 im = cv2.cvtColor(im[:, :, :3], cv2.COLOR_BGR2RGB)
@@ -1116,8 +1175,43 @@ def mosaic_frames(frames: list[FrameHomography],
         logger.warning("충전율 %.1f%% — 촬영 경로에 공백이 있거나 프레임 "
                        "footprint 가 크게 떨어져 있습니다.", fill_ratio * 100)
 
+    # ★ 픽셀마다 고른 프레임 번호(라벨 지도)를 남긴다. 이음매가 **어디를 지나는지** 알아야
+    #   이음매 자체의 밝기 단차 · 패널 위를 지나는 길이를 잴 수 있다. qc_tear 는 줄 어긋남만
+    #   재서, 갈평 RGB · Site-2 열화상에서 눈으로 나빠진 이음새를 "구분되지 않음"으로 냈다.
+    #   라벨 지도는 출력과 같은 원점(x_min, y_max), 해상도 ref_gsd 이다.
+    label_map_path = None
+    if label_map is not None:
+        try:
+            import json as _json
+            _lp = Path(output_path).with_name(Path(output_path).stem + "_labels.tif")
+            with rasterio.open(_lp, "w", driver="GTiff", width=int(label_map.shape[1]),
+                               height=int(label_map.shape[0]), count=1, dtype="int32",
+                               crs=f"EPSG:{epsg}", transform=from_origin(x_min, y_max, ref_gsd, ref_gsd),
+                               nodata=-1, compress="deflate") as _d:
+                _d.write(np.asarray(label_map, dtype=np.int32), 1)
+            _lp.with_suffix(".json").write_text(_json.dumps(
+                {"label_gsd_m": float(ref_gsd), "mosaic_gsd_m": float(gsd_m),
+                 "frames": {str(i): Path(str(pth)).name for i, pth in enumerate(image_paths)}},
+                ensure_ascii=False, indent=1), encoding="utf-8")
+            label_map_path = str(_lp)
+            logger.info("라벨 지도 저장: %s (%d × %d, %.3f m)", _lp.name, label_map.shape[1], label_map.shape[0], ref_gsd)
+            # ★ 패널 판정 지도 — 단위 배정은 패널로 판정된 화소에만 적용된다. Site-1 에서 도로 · 옥상에
+            #   네모 블록이 생겼는데, 판정이 그늘진 아스팔트 · 어두운 지붕까지 패널로 덮었는지 보려면 필요.
+            if _panel_mask_save is not None and _panel_mask_save.shape == label_map.shape:
+                _pp = Path(output_path).with_name(Path(output_path).stem + "_panelmask.tif")
+                with rasterio.open(_pp, "w", driver="GTiff", width=int(label_map.shape[1]),
+                                   height=int(label_map.shape[0]), count=1, dtype="uint8",
+                                   crs=f"EPSG:{epsg}", transform=from_origin(x_min, y_max, ref_gsd, ref_gsd),
+                                   compress="deflate") as _d:
+                    _d.write(np.asarray(_panel_mask_save, dtype=np.uint8), 1)
+                logger.info("패널 판정 지도 저장: %s (패널 %.1f%%)", _pp.name,
+                            100.0 * float(np.mean(_panel_mask_save[label_map >= 0])) if (label_map >= 0).any() else 0.0)
+        except Exception as _e:
+            logger.warning("라벨 지도를 저장하지 못했습니다: %s", _e)
+
     return {
         "output_path": str(output_path),
+        "label_map_path": label_map_path,
         "width": out_w, "height": out_h, "gsd_m": gsd_m, "epsg": epsg,
         "blend_mode": cfg.blend_mode,
         "seam_optimize": cfg.seam_optimize,

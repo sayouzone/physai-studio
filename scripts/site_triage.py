@@ -593,8 +593,23 @@ def pipeline_transit(names, x, y, min_run=3, dev_deg=45.0, cross_factor=1.5):
         dv = abs(((math.degrees(a_ - h)) + 90) % 180 - 90)
         if dv > dev_deg: off.update((i, i + 1))
         else: on_v.extend((v[i], v[i + 1]))
-    on_v.sort(); lines = []; cur = []
-    for val in on_v:
+    # ★ 비행선 간격은 **줄(비행 방향으로 이어진 구간)마다 수직 좌표 중앙값 하나**로 잰다.
+    #   예전에는 비행 방향 이동의 모든 점을 1.5 m 안에서 묶었는데, 갈평 줌 비행처럼 줄 안에서
+    #   옆으로 흔들리면 한 줄이 여러 조각으로 갈라져 간격이 2.2 m (실제 15.6 m)로 나왔고,
+    #   문턱이 3.3 m 가 되어 줄 끝 선회(12 m) 아홉 곳 27장이 복귀 구간으로 빠졌다.
+    legs, run = [], []
+    for k, (i, a_) in enumerate(moves):
+        dv_ = abs(((math.degrees(a_ - h)) + 90) % 180 - 90)
+        ok_ = dv_ <= 20.0
+        if ok_ and run and moves[k - 1][0] == i - 1 and sess[i] == sess[run[-1]]:
+            run.append(i + 1)
+        else:
+            if len(run) >= 5: legs.append(run)
+            run = [i, i + 1] if ok_ else []
+    if len(run) >= 5: legs.append(run)
+    leg_v = sorted(sorted(v[t] for t in r)[len(r) // 2] for r in legs)
+    lines = []; cur = []
+    for val in (leg_v if len(leg_v) >= 2 else on_v):
         if cur and val - cur[-1] > 1.5: lines.append(sum(cur) / len(cur)); cur = []
         cur.append(val)
     if cur: lines.append(sum(cur) / len(cur))
@@ -611,7 +626,9 @@ def pipeline_transit(names, x, y, min_run=3, dev_deg=45.0, cross_factor=1.5):
     out = []
     for r in runs:
         cross = abs(v[r[-1]] - v[r[0]])
-        if spacing is None or cross > cross_factor * spacing:
+        # ★ 하한 20 m — 간격을 잘못 재도(갈평 2.2 m) 줄 끝 선회(한 칸, 5~16 m)는 걸리지 않게.
+        #   EWP 복귀 구간은 110 m 를 가로질러 그대로 잡힌다.
+        if cross > max(cross_factor * spacing if spacing else 0.0, 20.0):
             out.append(dict(sess=sess[r[0]], i0=r[0], i1=r[-1], n=len(r), cross=cross,
                             s0=seq[r[0]], s1=seq[r[-1]],
                             first=os.path.basename(names[r[0]]), last=os.path.basename(names[r[-1]])))
@@ -625,7 +642,8 @@ def print_pipeline_transit(pt, own):
     runs = pt["runs"]
     total = sum(r["n"] for r in runs)
     print()
-    print("   파이프라인이 기본으로 뺄 사진 (homography_pipeline --drop-transit, 같은 계산):")
+    print("   파이프라인이 기본으로 뺄 사진 (homography_pipeline --drop-transit, 같은 계산 — 비행선 간격 %s):"
+          % ("%.1f m" % pt["spacing"] if pt.get("spacing") else "?"))
     if not runs:
         print("     없음 — 기본값이 이 부지의 결과를 바꾸지 않습니다")
     else:
@@ -975,6 +993,18 @@ def main():
             print_sessions(sinfo)
             ptr = pipeline_transit(names, list(x), list(y))
             print_pipeline_transit(ptr, (sinfo or {}).get("transit"))
+            # ★ 비행선 사이 겹침이 작으면 2차 안내 매칭을 권한다 (갈평 RGB 40%: 교차 매칭 2%,
+            #   tie point 없는 프레임 81 → --guided-rematch 로 10). 프레임 짧은 변 기준 (보수적).
+            try:
+                _sp = (ptr or {}).get("spacing")
+                if _sp and frame_w and frame_h:
+                    _cross = float(min(frame_w, frame_h)); _ov = 1.0 - float(_sp) / _cross
+                    print("   비행선 사이 겹침 %.0f%% (간격 %.1f m, 프레임 짧은 변 %.1f m)" % (100 * _ov, _sp, _cross))
+                    if _ov < 0.5:
+                        print("   ★ 겹침이 50%% 미만입니다 — 비행선 사이 매칭이 약해 tie point 없는 프레임이 많이 생깁니다.")
+                        print("     homography_pipeline 에 --guided-rematch 를 주십시오 (갈평 RGB 겹침 40%%: tie point 없는 프레임 81 → 10).")
+            except Exception:
+                pass
             if sinfo is not None:
                 sinfo["pipe_transit"] = ptr
 

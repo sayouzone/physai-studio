@@ -203,3 +203,62 @@ def build_two_layer_dsm(coarse_gray: np.ndarray, coarse_valid: np.ndarray,
                 "층 차이 %.2f m — 단일 평면이 남기던 Δh·k 오차를 없앱니다",
                 ny, nx, cell_m, frac * 100, (1 - frac) * 100, ground_drop_m)
     return dsm
+
+
+def periodic_panel_mask(gray, valid, cell_m, *, thresh: float = 20.0,
+                        scales=((4.0, 0.3, 3.0), (8.0, 0.6, 6.0))):
+    """두 창 크기에서 잰 두 방향 격자 점수 중 큰 쪽으로 판정한다.
+
+    ★ 갈평(수상 단지)은 흰 보행로 격자의 주기가 3 m 를 넘어 4 m 창(주기 ≤ 3 m)으로는 단지를
+      거의 못 잡았다(3.0%). 8 m 창(주기 ≤ 6 m)을 함께 쓴다. EWP · Site-1 은 4 m 창이 모듈선을 잡는다.
+    """
+    score = None
+    for win_m, pmin, pmax in scales:
+        sc = _periodic_score(gray, valid, cell_m, win_m=win_m, min_period_m=pmin, max_period_m=pmax)
+        score = sc if score is None else np.maximum(score, sc)
+    return score >= thresh
+
+
+def _periodic_score(gray, valid, cell_m, *, win_m: float = 4.0,
+                    min_period_m: float = 0.3, max_period_m: float = 3.0):
+    """창마다 **두 방향 격자** 주기가 있는지로 패널을 판정한다 (밝기 Otsu 와 함께 쓴다).
+
+    ★ Site-1 RGB: 밝기 Otsu 만으로는 도로 · 트랙 · 운동장 · 지붕까지 부지의 72.5% 가 패널로 잡혀,
+      패널 단위 배정이 부지 거의 전체에 영상 축 방향 2.3 m 네모로 적용됐다 — 도로 · 옥상의 네모
+      밝기 블록의 원인. 패널 배열은 모듈 테두리가 줄 방향과 그 수직 두 방향으로 되풀이되고,
+      나무 · 운동장은 주기가 없으며 트랙 차선은 한 방향뿐이다.
+      스펙트럼을 같은 반경끼리 나눠 1/f 치우침을 지우고, 첫 봉우리와 30° 넘게 다른 방향의
+      봉우리까지 있어야 패널로 본다. Site-1 패널 장면에서 정밀도 0.62 → 0.93, 재현율 0.86.
+    """
+    g = gray.astype(np.float32)
+    w = max(16, int(round(win_m / cell_m))); w += w % 2
+    H, W = g.shape; score = np.zeros((H, W), np.float32)
+    fy = np.fft.fftfreq(w)[:, None]; fx = np.fft.fftfreq(w)[None, :]; fr = np.hypot(fy, fx)
+    band = (fr > cell_m / max_period_m) & (fr < cell_m / min_period_m)
+    ang = np.arctan2(np.broadcast_to(fy, fr.shape), np.broadcast_to(fx, fr.shape))
+    edges = np.linspace(0, fr.max() + 1e-9, 24); rb = np.digitize(fr, edges) - 1
+    hann = np.outer(np.hanning(w), np.hanning(w)).astype(np.float32)
+    st = w // 2
+    for y0 in range(0, H - w + 1, st):
+        for x0 in range(0, W - w + 1, st):
+            v = valid[y0:y0 + w, x0:x0 + w]
+            if v.mean() < 0.8:
+                continue
+            p = g[y0:y0 + w, x0:x0 + w]; p = (p - p.mean()) * hann
+            S = np.abs(np.fft.fft2(p)) ** 2
+            Wt = np.zeros_like(S)
+            for b0 in range(len(edges) - 1):
+                m = rb == b0
+                if m.any():
+                    Wt[m] = S[m] / (np.median(S[m]) + 1e-9)
+            Wb = np.where(band, Wt, 0.0)
+            if not np.isfinite(Wb).all():
+                continue
+            k1 = np.unravel_index(np.argmax(Wb), Wb.shape)
+            a1 = np.arctan2(fy[k1[0], 0], fx[0, k1[1]])
+            dang = np.abs(((ang - a1) + np.pi / 2) % np.pi - np.pi / 2)
+            ortho = band & (dang > np.radians(30))
+            r = float(min(Wb[k1], Wt[ortho].max())) if ortho.any() else 0.0
+            sl = (slice(y0 + st // 2, y0 + st // 2 + st), slice(x0 + st // 2, x0 + st // 2 + st))
+            score[sl] = np.maximum(score[sl], r)
+    return score

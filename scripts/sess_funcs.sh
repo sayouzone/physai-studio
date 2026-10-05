@@ -11,6 +11,10 @@ _sess_check() {
 
 # piece <출력 이름> <사진 폴더 이름> [override]
 #   세션·띠 조각 하나를 노출 보정 없이 만든다
+# ★ --panel-unit 2 → 1 (2026-10-02). 실제 단위는 '준 값과 검출한 모듈 크기 중 큰 쪽'이다.
+#   모듈이 2 m 보다 작은 갈평(1.8 m)에서 2 m 를 주면 단위가 2.0 m 로 모듈 경계와 어긋나
+#   이음매가 패널을 잘랐다. 1 m 면 모듈 크기(1.8 m)에 맞아 이음매 어긋남 0.030 → 0.020 m.
+#   모듈이 2 m 이상인 Site-1(2.3 m) · EWP(3.3 m)는 결과가 소수점까지 같았다.
 piece() {
   _sess_check || return 1
   if [ -n "$3" ]; then export SAYOU_PLANE_OVERRIDE="$3"; fi
@@ -18,7 +22,7 @@ piece() {
   local extra; eval "extra=(${PIECE_ARGS:-})"
   echo "=== $1  ($2)   GSD $G   매칭 축소 ${SAYOU_MATCH_SCALE:-끔}   override ${SAYOU_PLANE_OVERRIDE:-없음}   추가 옵션 ${PIECE_ARGS:-없음}"
   python scripts/homography_pipeline.py --image-dir "$IMAGE_DIR/$2" --output-dir "$IMAGE_DIR/$1" \
-    --offnadir-frac 0.32 --smooth-weak-attitude --gsd "$G" --panel-unit 2 --no-two-layer \
+    --offnadir-frac 0.32 --smooth-weak-attitude --gsd "$G" --panel-unit 1 --no-two-layer \
     --no-exposure-comp "${extra[@]}" 2>&1 | tee "$IMAGE_DIR/$1.log" | \
     grep -E "환경변수로 지정|기준면 출처|매칭용 축소|모자이크 저장|비행선 밖 구간|순번 제외|장을 빼고"
   unset SAYOU_PLANE_OVERRIDE PIECE_ARGS
